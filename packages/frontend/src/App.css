@@ -1,0 +1,76 @@
+.app-header {
+  align-items: center;
+  background: #1a1d27;
+  border-bottom: 1px solid #2d3748;
+  display: flex;
+  height: 64px;
+  justify-content: space-between;
+  padding: 0 32px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.app-title {
+  color: #e2e8f0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.app-main {
+  margin: 0 auto;
+  max-width: 900px;
+  padding: 32px 24px;
+}
+
+.app-main--chat {
+  max-width: 1680px;
+}
+
+.chat-workspace {
+  align-items: start;
+  display: grid;
+  gap: 32px;
+  grid-template-columns: minmax(0, 2fr) minmax(600px, 1fr);
+}
+
+.chat-workspace__chat,
+.chat-workspace__portfolio {
+  min-width: 0;
+}
+
+.chat-workspace__chat {
+  position: sticky;
+  top: 84px;
+}
+
+.chat-workspace__portfolio {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+@media (max-width: 1250px) {
+  .chat-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-workspace__chat {
+    position: static;
+  }
+}
+
+@media (max-width: 700px) {
+  .app-header {
+    gap: 12px;
+    padding: 0 16px;
+  }
+
+  .app-title {
+    display: none;
+  }
+
+  .app-main {
+    padding: 24px 16px;
+  }
+}

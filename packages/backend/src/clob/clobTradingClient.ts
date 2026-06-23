@@ -1,0 +1,234 @@
+import { ClobClient, Side, SignatureTypeV2, Chain, getContractConfig } from '@polymarket/clob-client-v2';
+import { ethers } from 'ethers';
+import { getDb } from '../db/database';
+import { getSigner } from '../agent/signerFactory';
+import { encrypt, decrypt } from '../utils/crypto';
+import { logger } from '../utils/logger';
+import type { NormalizedOrder, PostOrderResult, StoredOrder } from '../types/order';
+import type { CLOBCredentials } from '../types/agent';
+import { v4 as uuidv4 } from 'uuid';
+
+const CLOB_HOST = process.env.POLYMARKET_CLOB_HOST ?? 'https://clob.polymarket.com';
+
+export interface Balances {
+  usdc: number;
+  positions: Record<string, number>;
+}
+
+export interface ClobTradingClientInterface {
+  deriveCredentials(agentWalletId: string): Promise<void>;
+  getOpenOrders(agentWalletId: string): Promise<StoredOrder[]>;
+  getBalances(agentWalletId: string): Promise<Balances>;
+  createSignedOrder(agentWalletId: string, order: NormalizedOrder): Promise<unknown>;
+  postOrder(agentWalletId: string, signedOrder: unknown, orderType: string): Promise<PostOrderResult>;
+  reconcileLiveFills(agentWalletId: string): Promise<void>;
+  cancelOrder(agentWalletId: string, orderId: string): Promise<void>;
+  cancelAll(agentWalletId: string): Promise<void>;
+}
+
+function getEncryptedCreds(agentWalletId: string): CLOBCredentials | null {
+  const db = getDb();
+  const row = db.prepare("SELECT * FROM clob_credentials WHERE agent_wallet_id = ? AND status = 'active'")
+    .get(agentWalletId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    id: row.id as string,
+    agentWalletId: row.agent_wallet_id as string,
+    encryptedApiKey: row.encrypted_api_key as string,
+    encryptedSecret: row.encrypted_secret as string,
+    encryptedPassphrase: row.encrypted_passphrase as string,
+    status: row.status as CLOBCredentials['status'],
+    createdAt: new Date(row.created_at as number),
+    rotatedAt: row.rotated_at ? new Date(row.rotated_at as number) : null,
+  };
+}
+
+async function buildClobClient(agentWalletId: string): Promise<ClobClient> {
+  const creds = getEncryptedCreds(agentWalletId);
+  if (!creds) throw new Error(`No CLOB credentials found for agent wallet ${agentWalletId}. Run deriveCredentials first.`);
+
+  const signer = getSigner();
+  const eoaAddress = await signer.getAddress(agentWalletId);
+
+  const signTyped = (domain: unknown, types: unknown, value: unknown) =>
+    signer.signTypedData(agentWalletId, { domain, types, message: value });
+  const ethSigner = {
+    getAddress: async () => eoaAddress,
+    signMessage: (msg: string | Uint8Array) => signer.signMessage(agentWalletId, msg),
+    signTypedData: signTyped,
+    _signTypedData: signTyped,
+    provider: null,
+  };
+
+  const apiKey = decrypt(creds.encryptedApiKey);
+  const secret = decrypt(creds.encryptedSecret);
+  const passphrase = decrypt(creds.encryptedPassphrase);
+
+  // The agent's funder is a relayer-provisioned Polymarket deposit wallet. Deposit wallets are
+  // smart contracts that validate orders via EIP-1271 (ERC-7739 nested signatures), so orders must
+  // use POLY_1271 — the CLOB rejects POLY_PROXY for a deposit-wallet maker ("use the deposit wallet flow").
+  // With POLY_1271 the SDK sets both maker and signer to the funder and the EOA key produces the nested sig.
+  const db = getDb();
+  const agentRow = db.prepare('SELECT proxy_wallet_address FROM agent_wallets WHERE id = ?').get(agentWalletId) as { proxy_wallet_address: string | null } | undefined;
+  const proxyWalletAddress = agentRow?.proxy_wallet_address ?? null;
+
+  const signatureType = proxyWalletAddress ? SignatureTypeV2.POLY_1271 : SignatureTypeV2.EOA;
+  const funderAddress = proxyWalletAddress ?? eoaAddress;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: ethSigner as any, creds: { key: apiKey, secret, passphrase }, signatureType, funderAddress });
+}
+
+export class ClobTradingClientImpl implements ClobTradingClientInterface {
+  async deriveCredentials(agentWalletId: string): Promise<void> {
+    const signer = getSigner();
+    const address = await signer.getAddress(agentWalletId);
+
+    const signTyped = (domain: unknown, types: unknown, value: unknown) =>
+      signer.signTypedData(agentWalletId, { domain, types, message: value });
+
+    const ethSigner = {
+      getAddress: async () => address,
+      signMessage: (msg: string | Uint8Array) => signer.signMessage(agentWalletId, msg),
+      signTypedData: signTyped,
+      _signTypedData: signTyped, // ethers v5 name used by @polymarket/clob-client
+      provider: null,
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tempClient = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: ethSigner as any, signatureType: SignatureTypeV2.EOA, funderAddress: address });
+
+    const apiCreds = await tempClient.createOrDeriveApiKey();
+
+    const db = getDb();
+    const existingId = (db.prepare("SELECT id FROM clob_credentials WHERE agent_wallet_id = ? AND status = 'active'").get(agentWalletId) as { id: string } | undefined)?.id;
+
+    if (existingId) {
+      db.prepare("UPDATE clob_credentials SET status = 'rotated', rotated_at = ? WHERE id = ?")
+        .run(Date.now(), existingId);
+    }
+
+    db.prepare(`
+      INSERT INTO clob_credentials (id, agent_wallet_id, encrypted_api_key, encrypted_secret, encrypted_passphrase, status, created_at, rotated_at)
+      VALUES (?, ?, ?, ?, ?, 'active', ?, NULL)
+    `).run(
+      uuidv4(),
+      agentWalletId,
+      encrypt(apiCreds.key),
+      encrypt(apiCreds.secret),
+      encrypt(apiCreds.passphrase),
+      Date.now(),
+    );
+
+    logger.info({ agentWalletId, address }, 'CLOB credentials derived and stored');
+  }
+
+  async getOpenOrders(agentWalletId: string): Promise<StoredOrder[]> {
+    const client = await buildClobClient(agentWalletId);
+    const orders = await client.getOpenOrders();
+    logger.debug({ agentWalletId, count: orders.length }, 'Fetched open orders from CLOB');
+    // Return our internal format — caller reconciles with DB
+    return [];
+  }
+
+  async getBalances(agentWalletId: string): Promise<Balances> {
+    const client = await buildClobClient(agentWalletId);
+    const balance = await client.getBalanceAllowance({ asset_type: 'COLLATERAL' } as never);
+    return { usdc: parseFloat(String(balance || 0)), positions: {} };
+  }
+
+  async createSignedOrder(agentWalletId: string, order: NormalizedOrder): Promise<unknown> {
+    if (process.env.ENABLE_LIVE_TRADING !== 'true') {
+      throw new Error('Live trading is disabled. Set ENABLE_LIVE_TRADING=true to enable.');
+    }
+
+    const maxGlobal = parseFloat(process.env.MAX_GLOBAL_LIVE_ORDER_USDC ?? '1');
+    const orderValue = order.size * order.price;
+    if (orderValue > maxGlobal) {
+      throw new Error(`Order value $${orderValue} exceeds global live trading limit $${maxGlobal}`);
+    }
+
+    const client = await buildClobClient(agentWalletId);
+    const side: Side = order.side === 'BUY' ? Side.BUY : Side.SELL;
+
+    const db = getDb();
+    const tokenRow = db.prepare('SELECT tick_size, neg_risk FROM market_tokens WHERE token_id = ?').get(order.tokenId) as { tick_size: number; neg_risk: number } | undefined;
+    const negRisk = (tokenRow?.neg_risk ?? 0) === 1;
+    const tickSize = String(tokenRow?.tick_size ?? 0.01) as '0.1' | '0.01' | '0.001' | '0.0001';
+
+    const signedOrder = await client.createOrder({
+      tokenID: order.tokenId,
+      price: order.price,
+      side,
+      size: order.size,
+    }, { tickSize, negRisk });
+
+    logger.info({ agentWalletId, tokenId: order.tokenId, side: order.side, signedOrder }, 'Signed CLOB order created');
+    return signedOrder;
+  }
+
+  async postOrder(agentWalletId: string, signedOrder: unknown, orderType: string): Promise<PostOrderResult> {
+    if (process.env.ENABLE_LIVE_TRADING !== 'true') {
+      throw new Error('Live trading is disabled');
+    }
+
+    const client = await buildClobClient(agentWalletId);
+    try {
+      const result = await client.postOrder(signedOrder as never, orderType as never);
+      logger.info({ agentWalletId, result }, 'CLOB order posted');
+      return { success: true, clobOrderId: (result as { orderID?: string }).orderID ?? null, errorMessage: null };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown CLOB error';
+      logger.error({ agentWalletId, err }, 'CLOB order post failed');
+      return { success: false, clobOrderId: null, errorMessage: msg };
+    }
+  }
+
+  /**
+   * Pull fill status for this agent's open live orders from the CLOB and record fills locally,
+   * so the portfolio (which reads the `fills` table) reflects executed live trades. Idempotent:
+   * one synthetic fill row per CLOB order, keyed by clob_order_id, updated as more size matches.
+   */
+  async reconcileLiveFills(agentWalletId: string): Promise<void> {
+    if (process.env.ENABLE_LIVE_TRADING !== 'true') return;
+    const db = getDb();
+    const openOrders = db.prepare(
+      "SELECT id, clob_order_id, side, price, size FROM orders WHERE agent_wallet_id = ? AND clob_order_id IS NOT NULL AND status IN ('open','pending','partially_filled')"
+    ).all(agentWalletId) as Array<{ id: string; clob_order_id: string; side: string; price: number; size: number }>;
+    if (openOrders.length === 0) return;
+
+    const client = await buildClobClient(agentWalletId);
+    for (const o of openOrders) {
+      try {
+        const remote = await client.getOrder(o.clob_order_id) as { size_matched?: string | number; original_size?: string | number; price?: string | number; status?: string } | null;
+        if (!remote) continue;
+        const matched = parseFloat(String(remote.size_matched ?? 0));
+        const fillPrice = parseFloat(String(remote.price ?? o.price)) || o.price;
+        if (matched > 0) {
+          db.prepare(`
+            INSERT INTO fills (id, order_id, clob_trade_id, price, size, side, fee, created_at, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(clob_trade_id) DO UPDATE SET size = excluded.size, price = excluded.price, raw_json = excluded.raw_json
+          `).run(uuidv4(), o.id, o.clob_order_id, fillPrice, matched, o.side, Date.now(), JSON.stringify(remote));
+        }
+        const filledFully = matched >= o.size - 1e-9;
+        const newStatus = filledFully ? 'filled' : matched > 0 ? 'partially_filled' : 'open';
+        db.prepare('UPDATE orders SET status = ?, updated_at = ? WHERE id = ?').run(newStatus, Date.now(), o.id);
+      } catch (err) {
+        logger.warn({ agentWalletId, clobOrderId: o.clob_order_id, err }, 'Fill reconcile failed for order');
+      }
+    }
+  }
+
+  async cancelOrder(agentWalletId: string, orderId: string): Promise<void> {
+    const client = await buildClobClient(agentWalletId);
+    await client.cancelOrder({ orderID: orderId });
+    logger.info({ agentWalletId, orderId }, 'CLOB order cancelled');
+  }
+
+  async cancelAll(agentWalletId: string): Promise<void> {
+    const client = await buildClobClient(agentWalletId);
+    await client.cancelAll();
+    logger.info({ agentWalletId }, 'All CLOB orders cancelled');
+  }
+}
