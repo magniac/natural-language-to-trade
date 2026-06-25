@@ -64,6 +64,22 @@ describe('OrderBuilder', () => {
     expect(result.order!.size).toBeCloseTo(10 / 0.40, 1);
   });
 
+  it('uses an authoritative live tick instead of rounding with stale cached metadata', () => {
+    const result = buildNormalizedOrder(
+      { ...INTENT, limitPrice: 0.194, maxSpendUSDC: 1 },
+      MARKET,
+      'agent-1',
+      'intent-1',
+      0.001,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.order!.price).toBe(0.194);
+    expect(result.order!.amountUsdc).toBe(1);
+    expect(result.order!.executionOrderType).toBe('FOK');
+    expect(result.order!.size).toBe(5.154639);
+  });
+
   it('uses direct size when provided', () => {
     const intent = { ...INTENT, maxSpendUSDC: undefined, size: 50 };
     const result = buildNormalizedOrder(intent as TradeIntent, MARKET, 'agent-1', 'intent-1');

@@ -4,7 +4,7 @@ import { logger } from '../utils/logger';
 import { resolveLlmApiKey } from '../utils/llmKeyStore';
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const PARSE_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-3-haiku';
+const PARSE_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-sonnet-4.6';
 
 const SYSTEM_PROMPT = `You are a strict trade intent parser for a prediction market trading system.
 Your job is to convert natural language trade requests into a structured JSON object.

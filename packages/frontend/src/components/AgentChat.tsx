@@ -1,6 +1,6 @@
 import React from 'react';
 import Button from './Button';
-import { loadSession, buildSignedHeaders, SESSION_SAVED_EVENT } from '../lib/sessionSigner';
+import { loadSession, getSessionStatus, buildSignedHeaders, SESSION_SAVED_EVENT } from '../lib/sessionSigner';
 import type { AgentSession } from '../lib/sessionSigner';
 
 interface ToolCall {
@@ -102,16 +102,17 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
           })()}
 
           {tc.name === 'place_trade' && (() => {
-            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
+            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; status?: string | null; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
             if (r?.success) {
               const isLive = r.mode === 'live';
+              const liveFilled = isLive && r.status?.toLowerCase() === 'matched';
               return (
                 <div style={{ marginTop: 8, fontSize: 12 }}>
                   <p style={{ color: '#4ade80', marginBottom: 4 }}>
-                    {isLive ? 'Live trade submitted' : 'Trade executed (paper)'}
+                    {isLive ? (liveFilled ? 'Live trade filled' : 'Live trade submitted') : 'Trade executed (paper)'}
                   </p>
                   {isLive ? (
-                    <p style={{ color: '#a0aec0' }}>{r.side} {r.outcome} @ ${r.limitPrice?.toFixed(3)} · ${r.orderValue?.toFixed(2)} order</p>
+                    <p style={{ color: '#a0aec0' }}>{r.side} {r.outcome} @ ${r.limitPrice?.toFixed(3)} · ${r.orderValue?.toFixed(2)} {liveFilled ? 'filled' : 'order'}</p>
                   ) : (
                     <p style={{ color: '#a0aec0' }}>{r.side} {r.outcome} @ ${r.fillPrice?.toFixed(3)} × {r.fillSize?.toFixed(2)} shares</p>
                   )}
@@ -146,6 +147,10 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
 
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   const isUser = msg.role === 'user';
+  const hasContent = msg.content.trim().length > 0;
+  const hasToolCalls = Boolean(msg.toolCalls?.length);
+  if (!msg.loading && !hasContent && !hasToolCalls) return null;
+
   return (
     <div style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start', marginBottom: 16 }}>
       <div style={{ maxWidth: '78%' }}>
@@ -160,17 +165,19 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
             <span style={{ fontSize: 11, color: '#6b7280' }}>Agent</span>
           </div>
         )}
-        <div style={{
-          padding: '10px 14px', borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-          background: isUser ? '#6366f1' : '#1a1d27',
-          border: isUser ? 'none' : '1px solid #2d3748',
-          color: '#e2e8f0', fontSize: 14, lineHeight: 1.6,
-          whiteSpace: msg.loading ? 'normal' : 'pre-wrap',
-        }}>
-          {msg.loading ? (
-            <span style={{ color: '#6b7280' }}>Thinking…</span>
-          ) : msg.content}
-        </div>
+        {(msg.loading || hasContent) && (
+          <div style={{
+            padding: '10px 14px', borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+            background: isUser ? '#6366f1' : '#1a1d27',
+            border: isUser ? 'none' : '1px solid #2d3748',
+            color: '#e2e8f0', fontSize: 14, lineHeight: 1.6,
+            whiteSpace: msg.loading ? 'normal' : 'pre-wrap',
+          }}>
+            {msg.loading ? (
+              <span style={{ color: '#6b7280' }}>Thinking…</span>
+            ) : msg.content}
+          </div>
+        )}
         {msg.toolCalls && msg.toolCalls.length > 0 && (
           <div style={{ marginTop: 4 }}>
             {msg.toolCalls.map((tc, i) => <ToolCallCard key={i} tc={tc} />)}
@@ -203,7 +210,10 @@ function loadPersistedMessages(agentWalletId: string): ChatMessage[] {
     const raw = localStorage.getItem(chatStorageKey(agentWalletId));
     if (!raw) return [WELCOME_MSG];
     const parsed = JSON.parse(raw) as ChatMessage[];
-    return parsed.length ? parsed : [WELCOME_MSG];
+    const usable = parsed.filter(m =>
+      m.role === 'user' || m.content?.trim().length > 0 || Boolean(m.toolCalls?.length)
+    );
+    return usable.length ? usable : [WELCOME_MSG];
   } catch {
     return [WELCOME_MSG];
   }
@@ -212,7 +222,9 @@ function loadPersistedMessages(agentWalletId: string): ChatMessage[] {
 function saveMessages(agentWalletId: string, msgs: ChatMessage[]) {
   try {
     // Don't persist loading placeholders
-    const toSave = msgs.filter(m => !m.loading);
+    const toSave = msgs.filter(m =>
+      !m.loading && (m.role === 'user' || m.content.trim().length > 0 || Boolean(m.toolCalls?.length))
+    );
     localStorage.setItem(chatStorageKey(agentWalletId), JSON.stringify(toSave));
   } catch { /* quota exceeded — ignore */ }
 }
@@ -255,6 +267,13 @@ export default function AgentChat() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  function clearChat() {
+    if (!session || loading) return;
+    localStorage.removeItem(chatStorageKey(session.agentWalletId));
+    setMessages([WELCOME_MSG]);
+    setInput('');
+  }
+
   async function sendMessage(text?: string) {
     const content = (text ?? input).trim();
     if (!content || loading || !session) return;
@@ -268,7 +287,7 @@ export default function AgentChat() {
 
     // Build conversation history (exclude welcome and loading messages)
     const history = [...messages, userMsg]
-      .filter(m => !m.loading && m.id !== 'welcome')
+      .filter(m => !m.loading && m.id !== 'welcome' && m.content.trim().length > 0)
       .map(m => ({ role: m.role === 'user' ? 'user' as const : 'assistant' as const, content: m.content }));
 
     try {
@@ -282,7 +301,9 @@ export default function AgentChat() {
       });
 
       const data = await res.json() as { response?: string; toolCalls?: ToolCall[]; error?: string };
-      const responseText = res.ok ? (data.response ?? '') : (data.error ?? 'Something went wrong.');
+      const responseText = res.ok
+        ? (data.response?.trim() || 'The agent returned an empty response. Please try again.')
+        : (data.error?.trim() || 'Something went wrong.');
 
       const completedTrade = data.toolCalls?.some(tc => {
         const result = tc.result as { success?: boolean } | undefined;
@@ -305,16 +326,47 @@ export default function AgentChat() {
   }
 
   if (!session) {
+    const status = getSessionStatus();
+    const expired = status.state === 'expired';
     return (
       <div style={{ background: '#1a1d27', border: '1px solid #2d3748', borderRadius: 12, padding: 24 }}>
         <h3 style={{ fontSize: 15, fontWeight: 700, color: '#e2e8f0', marginBottom: 8 }}>Agent Chat</h3>
-        <p style={{ fontSize: 13, color: '#6b7280' }}>Complete Agent Setup first to start chatting.</p>
+        {expired ? (
+          <>
+            <p style={{ fontSize: 13, color: '#fbbf24', marginBottom: 6 }}>
+              Your trading policy has expired{status.expiresAt ? ` (on ${new Date(status.expiresAt * 1000).toLocaleString()})` : ''}.
+            </p>
+            <p style={{ fontSize: 13, color: '#6b7280' }}>
+              Go to <strong style={{ color: '#a0aec0' }}>Agent Setup</strong> and re-sign the policy to start a fresh session. Your wallet, funding, and approvals are all still intact — you only need to sign again.
+            </p>
+          </>
+        ) : (
+          <p style={{ fontSize: 13, color: '#6b7280' }}>Complete Agent Setup first to start chatting.</p>
+        )}
       </div>
     );
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 200px)', minHeight: 500 }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        paddingBottom: 10, borderBottom: '1px solid #2d3748',
+      }}>
+        <span style={{ color: '#e2e8f0', fontSize: 14, fontWeight: 700 }}>Agent Chat</span>
+        <button
+          type="button"
+          onClick={clearChat}
+          disabled={loading || messages.length <= 1}
+          style={{
+            padding: '5px 10px', borderRadius: 6, border: '1px solid #374151',
+            background: 'transparent', color: loading || messages.length <= 1 ? '#4b5563' : '#9ca3af',
+            cursor: loading || messages.length <= 1 ? 'not-allowed' : 'pointer', fontSize: 12,
+          }}
+        >
+          Clear chat
+        </button>
+      </div>
       {/* Message list */}
       <div style={{
         flex: 1, overflowY: 'auto', padding: '20px 0',

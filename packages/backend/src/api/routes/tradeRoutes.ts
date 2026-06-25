@@ -6,12 +6,33 @@ import { runPolicyEngine, type AccountState, type UsageState, type MarketState }
 import { simulateTrade, createSimulatorState } from '../../simulator/paperTradingSimulator';
 import { buildNormalizedOrder } from '../../clob/orderBuilder';
 import { ClobTradingClientImpl } from '../../clob/clobTradingClient';
+import { selectTradeLimitPrice } from '../../clob/marketPricing';
+import { repairMatchedFillsForAgent } from '../../clob/fillAccounting';
 import { getDb } from '../../db/database';
 import { writeAudit } from '../../db/auditRepository';
 import { isLiveTradingEnabled } from '../middleware';
 import { logger } from '../../utils/logger';
 import { runAgentChat } from '../../agent/agentChat';
+import { ethers } from 'ethers';
+import { getContractConfig } from '@polymarket/clob-client-v2';
 import type { StoredPolicy } from '../../types/policy';
+
+/** On-chain pUSD balance of the agent's deposit wallet (the real wallet balance), or null. */
+async function getWalletBalanceUsdc(agentWalletId: string): Promise<number | null> {
+  const db = getDb();
+  const row = db.prepare('SELECT proxy_wallet_address FROM agent_wallets WHERE id = ?').get(agentWalletId) as { proxy_wallet_address: string | null } | undefined;
+  if (!row?.proxy_wallet_address) return null;
+  try {
+    const provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL ?? 'https://polygon-bor-rpc.publicnode.com');
+    const { collateral } = getContractConfig(137) as Record<string, string>;
+    const pUSD = new ethers.Contract(collateral, ['function balanceOf(address) view returns (uint256)'], provider);
+    const bal = await pUSD.balanceOf(row.proxy_wallet_address) as bigint;
+    return parseFloat(ethers.formatUnits(bal, 6));
+  } catch (err) {
+    logger.warn({ agentWalletId, err }, 'wallet balance fetch failed');
+    return null;
+  }
+}
 
 const router = Router();
 
@@ -27,6 +48,7 @@ function getSimState(agentWalletId: string, budgetUSDC: number) {
 
 function buildAccountState(agentWalletId: string, policy: StoredPolicy): AccountState {
   const db = getDb();
+  repairMatchedFillsForAgent(db, agentWalletId);
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const todayMs = today.getTime();
 
@@ -143,16 +165,31 @@ router.post('/intent', async (req, res) => {
 
   const resolvedMarket = resolveResult.candidates[0];
 
-  // If user didn't specify a price, use the real market price (ask for BUY, bid for SELL)
-  // so the policy engine sees a realistic limit price rather than the 0.50 placeholder.
+  const tokenId = intent.outcome === 'YES' ? resolvedMarket.yesTokenId : resolvedMarket.noTokenId;
+  let liveTopOfBook: number | null = null;
+
+  // If the user didn't specify a price, use the current executable CLOB quote for live
+  // orders. Gamma's cached best price can lag the book and cause an order to rest.
   if (!priceWasExplicit) {
-    const marketFillPrice = intent.side === 'BUY'
+    const cachedTopOfBook = intent.side === 'BUY'
       ? resolvedMarket.bestAsk
       : resolvedMarket.bestBid;
-    if (marketFillPrice != null) {
-      intent.limitPrice = marketFillPrice;
-      logger.info({ side: intent.side, marketFillPrice }, 'No price specified — using live market price');
+    if (!paperMode) {
+      try {
+        liveTopOfBook = await new ClobTradingClientImpl().getTopOfBookPrice(
+          policy.agentWalletId,
+          tokenId,
+          intent.side,
+        );
+      } catch (err) {
+        logger.warn({ agentWalletId: policy.agentWalletId, err }, 'Live top-of-book fetch failed — using cached price');
+      }
     }
+    intent.limitPrice = selectTradeLimitPrice(undefined, liveTopOfBook ?? cachedTopOfBook);
+    logger.info(
+      { side: intent.side, marketPrice: intent.limitPrice, source: liveTopOfBook != null ? 'clob' : 'cache' },
+      'No price specified — using top-of-book price',
+    );
   }
 
   // If the intent uses maxFraction ("sell all my shares"), look up the actual position
@@ -188,10 +225,10 @@ router.post('/intent', async (req, res) => {
 
   const marketState: MarketState = {
     marketId: resolvedMarket.marketId,
-    tokenId: intent.outcome === 'YES' ? resolvedMarket.yesTokenId : resolvedMarket.noTokenId,
+    tokenId,
     spreadBps,
-    bestBid: resolvedMarket.bestBid,
-    bestAsk: resolvedMarket.bestAsk,
+    bestBid: intent.side === 'SELL' && liveTopOfBook != null ? liveTopOfBook : resolvedMarket.bestBid,
+    bestAsk: intent.side === 'BUY' && liveTopOfBook != null ? liveTopOfBook : resolvedMarket.bestAsk,
     liquidityUsdc: resolvedMarket.liquidityUsdc,
     dataAgeMs,
     isActive: resolvedMarket.status === 'active',
@@ -272,16 +309,39 @@ router.post('/intent', async (req, res) => {
 
   // Live trading path (behind ENABLE_LIVE_TRADING feature flag)
   // Step 6: Build order
-  const buildResult = buildNormalizedOrder(intent, resolvedMarket, policy.agentWalletId, tradeIntentId);
+  const clobClient = new ClobTradingClientImpl();
+  let liveTickSize: number;
+  try {
+    liveTickSize = await clobClient.getMarketTickSize(policy.agentWalletId, tokenId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Tick-size fetch failed';
+    logger.error({ tradeIntentId, tokenId, err }, 'CLOB tick-size fetch failed');
+    return res.status(502).json({ error: 'Failed to verify live market tick size', reason: msg });
+  }
+
+  const buildResult = buildNormalizedOrder(
+    intent,
+    resolvedMarket,
+    policy.agentWalletId,
+    tradeIntentId,
+    liveTickSize,
+  );
   if (!buildResult.success || !buildResult.order) {
     return res.status(500).json({ error: 'Order build failed', reason: buildResult.errorMessage });
   }
 
   const order = buildResult.order;
+  const actualOrderType = order.executionOrderType ?? order.orderType;
+  if (!priceWasExplicit && Math.abs(order.price - intent.limitPrice) > 1e-9) {
+    return res.status(500).json({
+      error: 'Order price changed during construction',
+      reason: `Live quote ${intent.limitPrice} became ${order.price}; order was not submitted.`,
+    });
+  }
 
   // Hard global cap: never submit a live order above MAX_GLOBAL_LIVE_ORDER_USDC
   const maxLive = parseFloat(process.env.MAX_GLOBAL_LIVE_ORDER_USDC ?? '1');
-  const orderValueUsdc = order.price * order.size;
+  const orderValueUsdc = order.amountUsdc ?? order.price * order.size;
   if (orderValueUsdc > maxLive) {
     return res.status(403).json({
       error: `Order value $${orderValueUsdc.toFixed(2)} exceeds the live trading cap ($${maxLive}). Lower the order size.`,
@@ -289,7 +349,6 @@ router.post('/intent', async (req, res) => {
   }
 
   // Step 7: Sign and submit to Polymarket CLOB
-  const clobClient = new ClobTradingClientImpl();
   let signedOrder: unknown;
   try {
     signedOrder = await clobClient.createSignedOrder(policy.agentWalletId, order);
@@ -299,7 +358,7 @@ router.post('/intent', async (req, res) => {
     return res.status(500).json({ error: 'Failed to sign order', reason: msg });
   }
 
-  const postResult = await clobClient.postOrder(policy.agentWalletId, signedOrder, order.orderType);
+  const postResult = await clobClient.postOrder(policy.agentWalletId, signedOrder, actualOrderType);
 
   // Persist CLOB order ID to the orders row that the simulator wrote
   if (postResult.clobOrderId) {
@@ -324,6 +383,8 @@ router.post('/intent', async (req, res) => {
     clobOrderId: postResult.clobOrderId,
     price: order.price,
     size: order.size,
+    orderValue: orderValueUsdc,
+    status: postResult.clobStatus ?? null,
     riskSummary: decision.riskSummary,
   });
 });
@@ -403,6 +464,7 @@ router.get('/portfolio', async (req, res) => {
     try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
     catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
   }
+  repairMatchedFillsForAgent(db, agentWalletId);
 
   const summary = db.prepare(`
     SELECT
@@ -470,6 +532,8 @@ router.get('/portfolio', async (req, res) => {
     LIMIT 25
   `).all(agentWalletId);
 
+  const walletBalanceUsdc = await getWalletBalanceUsdc(agentWalletId);
+
   return res.json({
     agentWalletId,
     summary: {
@@ -479,6 +543,7 @@ router.get('/portfolio', async (req, res) => {
       totalSpentUsdc: summary.total_spent_usdc,
       budgetUsdc: policy.policyJson.trading.maxBudgetUSDC,
       budgetRemainingUsdc: policy.policyJson.trading.maxBudgetUSDC - summary.total_spent_usdc,
+      walletBalanceUsdc,
     },
     positions,
     recentOrders,
@@ -497,7 +562,8 @@ router.post('/chat', async (req, res) => {
 
   try {
     const result = await runAgentChat(messages, policy, policy.agentWalletId);
-    return res.json(result);
+    const response = result.response.trim() || 'The agent returned an empty response. Please try again.';
+    return res.json({ ...result, response });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Chat failed';
     logger.error({ err }, 'Agent chat error');

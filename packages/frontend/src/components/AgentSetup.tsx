@@ -2,7 +2,7 @@ import React from 'react';
 import { ethers } from 'ethers';
 import { api } from '../lib/api';
 import { signPolicyEIP712 } from '../lib/wallet';
-import { saveSession, saveAgentWallet, loadAgentWallet, loadSession, clearAgentWallet, clearSession } from '../lib/sessionSigner';
+import { saveSession, saveAgentWallet, loadAgentWallet, loadSession, getSessionStatus, clearAgentWallet, clearSession } from '../lib/sessionSigner';
 import Card from './Card';
 import Button from './Button';
 import StatusBadge from './StatusBadge';
@@ -346,7 +346,12 @@ export default function AgentSetup({ wallet }: Props) {
         expiresAt: expiresSec,
         revocationNonce: `revoke-${Date.now()}`,
         llm: {
-          allowedModels: ['anthropic/claude-3-haiku'],
+          allowedModels: [
+            'anthropic/claude-sonnet-4.6',
+            'anthropic/claude-sonnet-4.5',
+            'anthropic/claude-haiku-4-5',
+            'anthropic/claude-3-haiku',
+          ],
           maxRequestsPerHour: 20,
           maxTokensPerRequest: 4000,
           maxSpendPerDayUSDC: 2,
@@ -362,7 +367,7 @@ export default function AgentSetup({ wallet }: Props) {
             ...(allowBuy ? ['BUY' as const] : []),
             ...(allowSell ? ['SELL' as const] : []),
           ],
-          allowedOrderTypes: ['GTD', 'GTC'],
+          allowedOrderTypes: ['GTD', 'GTC', 'FOK', 'FAK'],
           maxPrice: maxPrice !== '' ? parseFloat(maxPrice) : null,
           minLiquidityUSDC: minLiquidityUSDC !== '' ? parseFloat(minLiquidityUSDC) : null,
           maxSpreadBps: maxSpreadBps !== '' ? parseInt(maxSpreadBps) : null,
@@ -738,15 +743,28 @@ export default function AgentSetup({ wallet }: Props) {
 
       {agent && step === 'done' && (
         <div>
-          <div style={{
-            background: '#14532d33', border: '1px solid #14532d66',
-            borderRadius: 8, padding: '14px 16px', marginBottom: 20,
-          }}>
-            <p style={{ color: '#86efac', fontSize: 14, fontWeight: 600 }}>Agent configured and ready.</p>
-            <p style={{ color: '#4ade80', fontSize: 12, marginTop: 6 }}>
-              Session key saved — switch to the <strong>Trade</strong> tab to submit intents.
-            </p>
-          </div>
+          {getSessionStatus().state === 'expired' ? (
+            <div style={{
+              background: '#7c2d1233', border: '1px solid #f59e0b66',
+              borderRadius: 8, padding: '14px 16px', marginBottom: 20,
+            }}>
+              <p style={{ color: '#fbbf24', fontSize: 14, fontWeight: 600 }}>Your trading policy has expired.</p>
+              <p style={{ color: '#fcd34d', fontSize: 12, marginTop: 6 }}>
+                Trading is paused until you re-sign. Your wallet, funding, and approvals are intact — click
+                {' '}<strong>Re-sign Policy</strong> below to start a fresh session.
+              </p>
+            </div>
+          ) : (
+            <div style={{
+              background: '#14532d33', border: '1px solid #14532d66',
+              borderRadius: 8, padding: '14px 16px', marginBottom: 20,
+            }}>
+              <p style={{ color: '#86efac', fontSize: 14, fontWeight: 600 }}>Agent configured and ready.</p>
+              <p style={{ color: '#4ade80', fontSize: 12, marginTop: 6 }}>
+                Session key saved — switch to the <strong>Chat</strong> tab to trade.
+              </p>
+            </div>
+          )}
 
           <div style={{ marginBottom: 20, display: 'flex', flexDirection: 'column', gap: 8 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
@@ -1132,6 +1150,9 @@ export default function AgentSetup({ wallet }: Props) {
               ? <Button variant="warning" size="sm" onClick={pauseAgent}>Pause Agent</Button>
               : <Button variant="primary" size="sm" onClick={resumeAgent}>Resume Agent</Button>
             }
+            <Button variant={getSessionStatus().state === 'expired' ? 'primary' : 'ghost'} size="sm" onClick={signAndSubmitPolicy} loading={loading}>
+              Re-sign Policy
+            </Button>
             <Button variant="danger" size="sm" onClick={revokePolicy} loading={loading}>
               Revoke Policy
             </Button>

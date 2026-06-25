@@ -13,11 +13,17 @@ function roundToTickSize(price: number, tickSize: number): number {
   return Math.round(price / tickSize) * tickSize;
 }
 
+function floorToDecimals(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.floor(value * factor) / factor;
+}
+
 export function buildNormalizedOrder(
   intent: TradeIntent,
   resolvedMarket: MarketResolverCandidate,
   agentWalletId: string,
   tradeIntentId: string,
+  tickSizeOverride?: number,
 ): BuildOrderResult {
   // Determine token ID from outcome — use only verified token IDs
   const tokenId = intent.outcome === 'YES'
@@ -39,7 +45,9 @@ export function buildNormalizedOrder(
   }
 
   // Apply tick size precision
-  const tickSize = tokenInfo.tickSize;
+  // Live callers pass the current CLOB tick size. The repository value comes
+  // from Gamma ingestion and may be stale or hardcoded to 0.01.
+  const tickSize = tickSizeOverride ?? tokenInfo.tickSize;
   const roundedPrice = roundToTickSize(intent.limitPrice, tickSize);
 
   if (Math.abs(roundedPrice - intent.limitPrice) > tickSize * 2) {
@@ -50,8 +58,15 @@ export function buildNormalizedOrder(
     };
   }
 
-  // Calculate size from maxSpendUSDC or direct size
+  // Calculate size from maxSpendUSDC or direct size.
+  // For live BUY-by-dollar orders, keep the original USDC amount too. Polymarket
+  // market orders take BUY `amount` in dollars; plain limit orders take share
+  // `size` and the SDK floors that size to 2 decimals. At prices like 0.194,
+  // flooring `$1 / 0.194` to 5.15 shares signs a $0.9991 maker amount, which
+  // CLOB rejects because marketable buys must be at least $1.
   let size: number;
+  const amountUsdc = intent.side === 'BUY' ? intent.maxSpendUSDC : undefined;
+  const executionOrderType = amountUsdc !== undefined ? 'FOK' as const : undefined;
   if (intent.size !== undefined) {
     size = intent.size;
   } else if (intent.maxSpendUSDC !== undefined) {
@@ -60,8 +75,10 @@ export function buildNormalizedOrder(
     return { success: false, order: null, errorMessage: 'Cannot determine order size' };
   }
 
-  // Round to 2 decimal places minimum
-  size = Math.floor(size * 100) / 100;
+  // Limit orders are rounded exactly as the SDK will round them. BUY-by-dollar
+  // marketable orders keep a high-precision estimated share size for display/DB;
+  // the signed order's actual maker amount comes from amountUsdc.
+  size = amountUsdc !== undefined ? floorToDecimals(size, 6) : floorToDecimals(size, 2);
   if (size <= 0) {
     return { success: false, order: null, errorMessage: 'Computed order size is zero or negative' };
   }
@@ -82,7 +99,9 @@ export function buildNormalizedOrder(
       tokenId,
       side: intent.side,
       price: roundedPrice,
+      amountUsdc,
       size,
+      executionOrderType,
       orderType: intent.orderType,
       expirationTimestamp,
       idempotencyKey,

@@ -9,6 +9,8 @@ import { runPolicyEngine, type AccountState, type UsageState, type MarketState }
 import { simulateTrade, createSimulatorState } from '../simulator/paperTradingSimulator';
 import { buildNormalizedOrder } from '../clob/orderBuilder';
 import { ClobTradingClientImpl } from '../clob/clobTradingClient';
+import { selectTradeLimitPrice } from '../clob/marketPricing';
+import { localStatusFromClobPost, recordImmediateMatchedFill, repairMatchedFillsForAgent } from '../clob/fillAccounting';
 import { parseTradeIntentFromJSON } from '../parser/tradeIntentParser';
 import { writeAudit } from '../db/auditRepository';
 import { resolveLlmApiKey } from '../utils/llmKeyStore';
@@ -17,8 +19,14 @@ import type { StoredPolicy } from '../types/policy';
 const chatSimStates = new Map<string, ReturnType<typeof createSimulatorState>>();
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const CHAT_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-haiku-4-5';
+const CHAT_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-sonnet-4.6';
 const MAX_TOOL_ROUNDS = 5;
+
+// Matches text that asserts a trade was actually completed (not offers/questions like
+// "shall I place the trade?"). Used to catch the model claiming success without calling place_trade.
+const CLAIMS_TRADE_DONE = /\b(i'?(?:ve| have)?\s*(?:just\s+)?(?:placed|made|executed|submitted|bought|sold|purchased)\b|(?:trade|order|buy|sell|purchase)\s+(?:is|was|has been|been)\s+(?:now\s+|successfully\s+)?(?:placed|submitted|executed|filled|completed?|live|done|confirmed)|successfully\s+(?:placed|bought|sold|executed|submitted)|(?:placed|submitted|filled|confirmed)\s+(?:your|the|a)\s+(?:order|trade|buy|sell)|order\s+(?:placed|submitted|filled|confirmed|complete))\b/i;
+// Negated / not-yet statements that should NOT be treated as a completion claim.
+const TRADE_NEGATED = /\b(no\s+(?:trade|order)|not\s+(?:yet\s+)?(?:placed|submitted|executed|been)|have\s?n'?t|has\s?n'?t|did\s?n'?t|wo\s?n'?t|was\s?n'?t|is\s?n'?t|never\s+placed|nothing\s+(?:was|has been)|yet\s+to\s+be|hasn't\s+been)\b/i;
 
 export interface ExecutedToolCall {
   name: string;
@@ -27,7 +35,78 @@ export interface ExecutedToolCall {
   error?: string;
 }
 
-type UserMessage = { role: 'user' | 'assistant'; content: string };
+/** Produce a safe, deterministic reply when the model goes silent after using a tool. */
+export function buildToolFallbackResponse(toolCalls: ExecutedToolCall[]): string | null {
+  const last = toolCalls[toolCalls.length - 1];
+  if (!last) return null;
+
+  const result = last.result as Record<string, unknown> | undefined;
+  if (last.name === 'place_trade') {
+    if (result?.success === true) {
+      return 'The trade was submitted successfully. See the order details below.';
+    }
+    if (result?.policyDenied === true) {
+      const reasons = Array.isArray(result.reasons) ? result.reasons.map(String).join('; ') : '';
+      return `I couldn't place the trade because the policy engine denied it${reasons ? `: ${reasons}` : '.'}`;
+    }
+    if (result?.ambiguous === true) {
+      return 'I found multiple matching markets. Please choose one from the options below.';
+    }
+    const error = typeof result?.error === 'string' ? result.error : last.error;
+    return `I couldn't place the trade${error ? `: ${error}` : '.'}`;
+  }
+
+  if (last.name === 'search_markets') {
+    const found = typeof result?.found === 'number' ? result.found : null;
+    return found === null
+      ? 'I searched the available markets. See the results below.'
+      : `I found ${found} matching market${found === 1 ? '' : 's'}. See the results below.`;
+  }
+
+  if (last.name === 'get_portfolio') {
+    return 'I checked your portfolio. See the current details below.';
+  }
+
+  return 'I completed the requested action. See the details below.';
+}
+
+export type UserMessage = { role: 'user' | 'assistant'; content: string };
+
+/**
+ * Keep persisted browser history valid and bounded for model providers that
+ * require alternating user/assistant turns. Empty bubbles are discarded,
+ * adjacent same-role turns are merged, and only the most recent context is sent.
+ */
+export function normalizeChatHistory(userMessages: UserMessage[], maxMessages = 20): UserMessage[] {
+  const merged: UserMessage[] = [];
+  for (const message of userMessages) {
+    const content = typeof message.content === 'string' ? message.content.trim() : '';
+    if (!content || (message.role !== 'user' && message.role !== 'assistant')) continue;
+
+    const previous = merged[merged.length - 1];
+    if (previous?.role === message.role) {
+      previous.content = `${previous.content}\n\n${content}`;
+    } else {
+      merged.push({ role: message.role, content });
+    }
+  }
+
+  const bounded = merged.slice(-maxMessages);
+  while (bounded[0]?.role === 'assistant') bounded.shift();
+  return bounded;
+}
+
+export function buildFalseTradeClaimResponse(text: string, toolCalls: ExecutedToolCall[]): string | null {
+  const placedThisTurn = toolCalls.some(t => t.name === 'place_trade' && (t.result as { success?: boolean } | undefined)?.success === true);
+  if (placedThisTurn || !CLAIMS_TRADE_DONE.test(text) || TRADE_NEGATED.test(text)) return null;
+
+  const failedTradeCall = [...toolCalls].reverse().find(t => t.name === 'place_trade');
+  if (failedTradeCall) {
+    return buildToolFallbackResponse([failedTradeCall]) ?? 'No trade was placed. The trade tool did not return success.';
+  }
+
+  return 'No trade was placed. I did not get a successful trade submission for this turn, so I will not claim an order exists. Please confirm the exact market, outcome, and amount and I can submit it.';
+}
 
 const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   {
@@ -83,13 +162,16 @@ function buildSystemPrompt(policy: StoredPolicy, accountState: AccountState, liv
 You can:
 - Search for markets and explain what they mean
 - Check the user's current portfolio and positions
-- Place paper trades (no real money) when the user asks you to
+- Place ${liveMode ? 'LIVE trades (real money on Polymarket)' : 'paper trades (simulated, no real money)'} when the user asks you to
 
 Agent policy (signed by user, enforced deterministically):
-- Budget remaining: $${accountState.budgetRemainingUSDC.toFixed(2)} of $${t.maxBudgetUSDC.toFixed(2)} total
+- Budget remaining RIGHT NOW: $${accountState.budgetRemainingUSDC.toFixed(2)} of $${t.maxBudgetUSDC.toFixed(2)} total
+- Spent so far TODAY: $${accountState.dailySpendUSDC.toFixed(2)} of $${t.maxDailySpendUSDC.toFixed(2)} daily cap
 - Max order size: $${t.maxOrderSizeUSDC.toFixed(2)} USDC per trade
-- Max daily spend: $${t.maxDailySpendUSDC.toFixed(2)} USDC
+- Open orders: ${accountState.openOrderCount}
 - Policy expires: ${expiresAt}
+
+CRITICAL about budget: the figures above are the LIVE truth, recomputed from actual filled trades on every message. They change as orders fill, cancel, or get sold. NEVER refuse a trade based on a budget or "daily limit reached" number you saw EARLIER in this conversation — those are stale (e.g. open orders you later cancelled no longer count). Cancelled and unfilled orders do NOT consume budget. Use ONLY the numbers in this message, or call get_portfolio to refresh. If you are unsure whether budget allows a trade, just call place_trade — the policy engine checks limits authoritatively and will return policyDenied with the real reason if it actually exceeds a limit. Do not pre-emptively decline on your own.
 
 Mode: ${liveMode ? 'LIVE trading — trades submit real orders to Polymarket with real money.' : 'Paper trading — trades are simulated, no real money.'}
 Safety: Every trade you place is validated by a deterministic policy engine. You cannot bypass it.
@@ -108,7 +190,12 @@ Before calling place_trade you MUST have confirmed ALL of:
 When calling place_trade: set marketQuery to the EXACT full market title from search results. Do NOT invent or guess a marketId — omit it entirely.
 For SELL trades: set maxFraction, never maxSpendUSDC.
 
-CRITICAL: Never tell the user a trade was placed unless the place_trade tool was called and returned success. If you did not call the tool, do not claim you did.`;
+CRITICAL — how trades actually happen:
+- A trade is placed ONLY by calling the place_trade tool. Writing a message is NOT placing a trade.
+- The moment the user confirms the market, outcome, and amount, you MUST call place_trade in that SAME response. Do not reply "I've placed it" / "done" / "order submitted" as text without the tool call — that is a lie, because nothing happened.
+- Only after place_trade returns success may you tell the user the trade was placed (quote the result).
+- If place_trade returns success=false, say explicitly that no trade was placed and explain the returned error/reason.
+- If you did not call place_trade, say explicitly that no trade has been placed yet.`;
 }
 
 async function toolSearchMarkets(args: { query: string }) {
@@ -192,6 +279,7 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
     try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
     catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
   }
+  repairMatchedFillsForAgent(db, agentWalletId);
 
   const totalSpent = (db.prepare(`
     SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
@@ -296,15 +384,28 @@ async function toolPlaceTrade(
     }
   }
 
-  // Use live market price if limitPrice not specified.
-  // Guard against 0/null from stale orderbook data — nullish coalescing won't catch 0.
-  const rawAsk = resolvedMarket.bestAsk;
-  const rawBid = resolvedMarket.bestBid;
-  const livePrice = args.side === 'BUY'
-    ? (rawAsk && rawAsk >= 0.01 ? rawAsk : 0.5)
-    : (rawBid && rawBid >= 0.01 ? rawBid : 0.5);
-  // Clamp to schema-valid range [0.01, 0.99] regardless of input
-  const limitPrice = Math.max(0.01, Math.min(0.99, args.limitPrice ?? livePrice));
+  const tokenId = args.outcome === 'YES' ? resolvedMarket.yesTokenId : resolvedMarket.noTokenId;
+  const db1 = getDb();
+  const modeRow = db1.prepare('SELECT paper_mode FROM agent_wallets WHERE id = ?').get(agentWalletId) as { paper_mode: number } | undefined;
+  const liveMode = process.env.ENABLE_LIVE_TRADING === 'true' && modeRow?.paper_mode === 0;
+
+  // Best market price for the side. Prefer the LIVE CLOB top-of-book (the cached gamma price is
+  // often stale, which is why limit orders were resting unfilled). Fall back to cache on failure.
+  const cachedPx = args.side === 'BUY' ? resolvedMarket.bestAsk : resolvedMarket.bestBid;
+  let marketPx = cachedPx && cachedPx >= 0.01 ? cachedPx : null;
+  if (liveMode && tokenId) {
+    try {
+      const live = await new ClobTradingClientImpl().getTopOfBookPrice(agentWalletId, tokenId, args.side);
+      if (live && live >= 0.01) marketPx = live;
+    } catch (err) {
+      logger.warn({ agentWalletId, err }, 'live top-of-book fetch failed — using cached price');
+    }
+  }
+
+  // Match Polymarket's default behavior: use the current executable quote exactly.
+  // Do not add a crossing cushion or round using Gamma's cached 0.01 tick metadata;
+  // markets can quote at finer increments (for example, an ask of 0.194).
+  const limitPrice = selectTradeLimitPrice(args.limitPrice, marketPx);
 
   const parseResult = parseTradeIntentFromJSON({
     action: 'trade',
@@ -325,7 +426,7 @@ async function toolPlaceTrade(
   }
 
   const intent = parseResult.intent;
-  // Override price with live market price regardless of what was parsed
+  // Preserve the price selected above (explicit user limit or live top of book).
   intent.limitPrice = limitPrice;
 
   // Resolve maxFraction → actual share count so the policy engine can evaluate the order
@@ -381,7 +482,6 @@ async function toolPlaceTrade(
     intentNonceUsed: false,
   };
 
-  const tokenId = args.outcome === 'YES' ? resolvedMarket.yesTokenId : resolvedMarket.noTokenId;
   const spreadBps = resolvedMarket.bestBid != null && resolvedMarket.bestAsk != null
     ? Math.round((resolvedMarket.bestAsk - resolvedMarket.bestBid) / resolvedMarket.bestAsk * 10_000) : 50;
 
@@ -389,8 +489,8 @@ async function toolPlaceTrade(
     marketId: resolvedMarket.marketId,
     tokenId,
     spreadBps,
-    bestBid: resolvedMarket.bestBid,
-    bestAsk: resolvedMarket.bestAsk,
+    bestBid: args.side === 'SELL' && marketPx != null ? marketPx : resolvedMarket.bestBid,
+    bestAsk: args.side === 'BUY' && marketPx != null ? marketPx : resolvedMarket.bestAsk,
     liquidityUsdc: resolvedMarket.liquidityUsdc,
     dataAgeMs: Date.now() - resolvedMarket.dataUpdatedAt.getTime(),
     isActive: resolvedMarket.status === 'active',
@@ -416,8 +516,7 @@ async function toolPlaceTrade(
     Date.now(),
   );
 
-  const agentRow = db.prepare('SELECT paper_mode FROM agent_wallets WHERE id = ?').get(agentWalletId) as { paper_mode: number } | undefined;
-  const liveEnabled = process.env.ENABLE_LIVE_TRADING === 'true' && agentRow?.paper_mode === 0;
+  const liveEnabled = liveMode;
 
   if (!liveEnabled) {
     // Paper trading path
@@ -455,11 +554,29 @@ async function toolPlaceTrade(
     return { success: false, error: `Order value $${orderValueUsdc.toFixed(2)} exceeds the live cap ($${maxLive}). Lower the amount.` };
   }
 
-  const buildResult = buildNormalizedOrder(intent, resolvedMarket, agentWalletId, tradeIntentId);
+  const clobClient = new ClobTradingClientImpl();
+  let liveTickSize: number;
+  try {
+    // This must happen before buildNormalizedOrder: Gamma stores 0.01 even for
+    // markets whose live CLOB tick is 0.001, which previously changed 0.193 to 0.190.
+    liveTickSize = await clobClient.getMarketTickSize(agentWalletId, tokenId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Tick-size fetch failed';
+    return { success: false, error: `Could not verify the live market tick size: ${msg}` };
+  }
+
+  const buildResult = buildNormalizedOrder(intent, resolvedMarket, agentWalletId, tradeIntentId, liveTickSize);
   if (!buildResult.success || !buildResult.order) {
     return { success: false, error: `Order build failed: ${buildResult.errorMessage}` };
   }
   const order = buildResult.order;
+  const actualOrderType = order.executionOrderType ?? order.orderType;
+  if (args.limitPrice == null && Math.abs(order.price - intent.limitPrice) > 1e-9) {
+    return {
+      success: false,
+      error: `Refusing to submit: live quote ${intent.limitPrice} changed to ${order.price} during order construction.`,
+    };
+  }
 
   // Persist the order row up front so it (and its eventual fills) are tracked. The live path
   // previously never inserted into `orders`, so live fills/positions were invisible to the portfolio.
@@ -470,11 +587,10 @@ async function toolPlaceTrade(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
   `).run(
     orderId, tradeIntentId, agentWalletId,
-    order.marketId, order.tokenId, order.side, order.price, order.size, order.orderType,
+    order.marketId, order.tokenId, order.side, order.price, order.size, actualOrderType,
     order.expirationTimestamp ?? null, order.idempotencyKey, nowMs, nowMs,
   );
 
-  const clobClient = new ClobTradingClientImpl();
   let signedOrder: unknown;
   try {
     signedOrder = await clobClient.createSignedOrder(agentWalletId, order);
@@ -484,14 +600,18 @@ async function toolPlaceTrade(
     return { success: false, error: `Failed to sign order: ${msg}` };
   }
 
-  const postResult = await clobClient.postOrder(agentWalletId, signedOrder, order.orderType);
+  const postResult = await clobClient.postOrder(agentWalletId, signedOrder, actualOrderType);
 
   if (postResult.clobOrderId) {
-    db.prepare(`UPDATE orders SET clob_order_id = ?, status = 'open', updated_at = ? WHERE id = ?`)
-      .run(postResult.clobOrderId, Date.now(), orderId);
+    const localStatus = localStatusFromClobPost(postResult);
+    db.prepare(`UPDATE orders SET clob_order_id = ?, status = ?, updated_at = ? WHERE id = ?`)
+      .run(postResult.clobOrderId, localStatus, Date.now(), orderId);
+    recordImmediateMatchedFill(db, orderId, order, postResult);
     // Record any immediate fill so the portfolio reflects the executed trade.
-    try { await clobClient.reconcileLiveFills(agentWalletId); }
-    catch (err) { logger.warn({ agentWalletId, err }, 'post-trade fill reconcile failed'); }
+    if (localStatus !== 'filled') {
+      try { await clobClient.reconcileLiveFills(agentWalletId); }
+      catch (err) { logger.warn({ agentWalletId, err }, 'post-trade fill reconcile failed'); }
+    }
   } else {
     db.prepare(`UPDATE orders SET status = 'failed', updated_at = ? WHERE id = ?`).run(Date.now(), orderId);
   }
@@ -511,8 +631,10 @@ async function toolPlaceTrade(
     success: true, mode: 'live',
     market: resolvedMarket.title, side: args.side, outcome: args.outcome,
     clobOrderId: postResult.clobOrderId,
-    limitPrice: intent.limitPrice,
-    orderValue: orderValueUsdc,
+    // Report the order that was actually persisted and submitted, not the pre-build intent.
+    limitPrice: order.price,
+    orderValue: order.amountUsdc ?? orderValueUsdc,
+    status: postResult.clobStatus ?? null,
   };
 }
 
@@ -550,15 +672,26 @@ export async function runAgentChat(
 
   const db = getDb();
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  const todayMs = today.getTime();
+  repairMatchedFillsForAgent(db, agentWalletId);
+  // Budget is computed live from actual fills — never from conversation history. Spend nets
+  // BUY against SELL, and only filled orders count (open/cancelled/failed orders do not).
   const totalSpent = (db.prepare(`
     SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
     FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?
   `).get(agentWalletId) as { total: number }).total;
+  const dailySpent = (db.prepare(`
+    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
+    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?
+  `).get(agentWalletId, todayMs) as { total: number }).total;
+  const openOrderCount = (db.prepare(
+    "SELECT COUNT(*) as cnt FROM orders WHERE agent_wallet_id=? AND status IN ('open','pending','partially_filled')"
+  ).get(agentWalletId) as { cnt: number }).cnt;
 
   const accountState: AccountState = {
     budgetRemainingUSDC: policy.policyJson.trading.maxBudgetUSDC - totalSpent,
-    dailySpendUSDC: 0,
-    openOrderCount: 0,
+    dailySpendUSDC: dailySpent,
+    openOrderCount,
     positionSizeByMarket: {},
   };
 
@@ -567,13 +700,18 @@ export async function runAgentChat(
 
   const client = new OpenAI({ baseURL: OPENROUTER_BASE, apiKey });
   const systemPrompt = buildSystemPrompt(policy, accountState, liveMode);
+  const normalizedHistory = normalizeChatHistory(userMessages);
+  if (normalizedHistory.length === 0) {
+    return { response: 'Please enter a message so I can help.', toolCalls: [] };
+  }
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: 'system', content: systemPrompt },
-    ...userMessages,
+    ...normalizedHistory,
   ];
 
   const allToolCalls: ExecutedToolCall[] = [];
+  let emptyCompletionRetries = 0;
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await client.chat.completions.create({
@@ -592,8 +730,54 @@ export async function runAgentChat(
     messages.push(msg);
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      const text = typeof msg.content === 'string' ? msg.content.trim() : '';
+      if (!text) {
+        logger.warn({
+          agentWalletId,
+          round,
+          finishReason: choice.finish_reason,
+          toolsCalledThisTurn: allToolCalls.map(t => t.name),
+        }, 'chat model returned an empty completion');
+
+        // Never ask the model to continue after a tool has run: it could repeat a
+        // side effect such as placing the same trade twice. Return a deterministic
+        // summary of the completed tool call instead.
+        const toolFallback = buildToolFallbackResponse(allToolCalls);
+        if (toolFallback) return { response: toolFallback, toolCalls: allToolCalls };
+
+        if (emptyCompletionRetries < 2) {
+          emptyCompletionRetries += 1;
+          // Rebuild a provider-valid transcript. Inserting a system message after
+          // user/assistant turns is invalid for some Anthropic routes.
+          const retryHistory = emptyCompletionRetries === 1
+            ? normalizedHistory
+            : normalizedHistory.slice(-4);
+          messages.splice(0, messages.length,
+            {
+              role: 'system',
+              content: `${systemPrompt}\n\nIMPORTANT: Return a clear, non-empty answer to the user's latest message.`,
+            },
+            ...retryHistory,
+          );
+          continue;
+        }
+
+        return {
+          response: 'I did not receive a usable response from the language model. Please try again.',
+          toolCalls: allToolCalls,
+        };
+      }
+      // Backstop: if the model claims a trade was executed but there was no
+      // successful place_trade result in this turn, do not pass that claim to
+      // the UI. A retry can produce another false positive; deterministic
+      // correction is safer than letting the model narrate a non-existent order.
+      const falseTradeClaimResponse = buildFalseTradeClaimResponse(text, allToolCalls);
+      if (falseTradeClaimResponse) {
+        logger.warn({ agentWalletId, round }, 'model claimed a trade without a successful place_trade result');
+        return { response: falseTradeClaimResponse, toolCalls: allToolCalls };
+      }
       logger.info({ agentWalletId, round, toolsCalledThisTurn: allToolCalls.map(t => t.name) }, 'chat turn finished without (further) tool calls');
-      return { response: msg.content ?? '', toolCalls: allToolCalls };
+      return { response: text, toolCalls: allToolCalls };
     }
     logger.info({ agentWalletId, round, tools: msg.tool_calls.map(t => t.function.name) }, 'chat LLM requested tool calls');
 

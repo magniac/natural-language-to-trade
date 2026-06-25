@@ -12,7 +12,7 @@ import { resolveLlmApiKey } from '../utils/llmKeyStore';
 import type { StoredPolicy } from '../types/policy';
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const LOOP_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-3-haiku';
+const LOOP_MODEL = process.env.OPENROUTER_MODEL ?? 'anthropic/claude-sonnet-4.6';
 const MARKETS_PER_SCAN = 10;
 const DEFAULT_ORDER_SIZE_USDC = 0.50;
 

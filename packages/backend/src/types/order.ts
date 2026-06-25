@@ -17,7 +17,13 @@ export interface NormalizedOrder {
   tokenId: string;
   side: OrderSide;
   price: number;
+  /** Dollar amount for BUY-by-USDC marketable orders. Keeps $1.00 from being
+   * rounded down to $0.9991 by the limit-order share-size precision rules. */
+  amountUsdc?: number;
   size: number;
+  /** Actual CLOB order type used when it differs from the policy-visible intent
+   * order type. Dollar buys execute as FOK market orders to avoid resting. */
+  executionOrderType?: OrderType;
   orderType: OrderType;
   expirationTimestamp: number | null;
   idempotencyKey: string;
@@ -64,4 +70,9 @@ export interface PostOrderResult {
   success: boolean;
   clobOrderId: string | null;
   errorMessage: string | null;
+  clobStatus?: string | null;
+  makingAmount?: string | null;
+  takingAmount?: string | null;
+  tradeIds?: string[];
+  raw?: unknown;
 }
