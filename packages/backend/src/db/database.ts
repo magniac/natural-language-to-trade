@@ -20,6 +20,9 @@ export function getDb(): DatabaseSync {
   // Migrations — safe to run repeatedly; errors on existing columns are swallowed
   try { db.exec(`ALTER TABLE agent_wallets ADD COLUMN paper_mode INTEGER NOT NULL DEFAULT 1`); } catch { /* already exists */ }
   try { db.exec(`ALTER TABLE agent_wallets ADD COLUMN proxy_wallet_address TEXT`); } catch { /* already exists */ }
+  // Venue tag so Polymarket and Hyperliquid trades share the orders/trade_intents tables.
+  try { db.exec(`ALTER TABLE orders ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'`); } catch { /* already exists */ }
+  try { db.exec(`ALTER TABLE trade_intents ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'`); } catch { /* already exists */ }
 
   // Drop UNIQUE constraint on agent_wallets.address — imported EOA keys can be reused across agent rows.
   // SQLite requires a full table recreation to remove a constraint.

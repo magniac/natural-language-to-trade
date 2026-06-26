@@ -20,12 +20,14 @@ interface ChatMessage {
 
 const TOOL_LABELS: Record<string, string> = {
   search_markets: 'Searched markets',
+  search_hyperliquid_markets: 'Searched Hyperliquid',
   get_portfolio: 'Checked portfolio',
   place_trade: 'Placed trade',
 };
 
 const TOOL_ICONS: Record<string, string> = {
   search_markets: '🔍',
+  search_hyperliquid_markets: '🪙',
   get_portfolio: '📊',
   place_trade: '💱',
 };
@@ -83,17 +85,40 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
             );
           })()}
 
+          {tc.name === 'search_hyperliquid_markets' && (() => {
+            const r = tc.result as { markets?: Array<{ title: string; coin: string; price: number | null }> } | undefined;
+            if (!r?.markets?.length) return <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>No Hyperliquid coins found.</p>;
+            return (
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {r.markets.map((m, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                    <span style={{ color: '#e2e8f0' }}>{m.coin}</span>
+                    <span style={{ color: '#4ade80', whiteSpace: 'nowrap' }}>{m.price != null ? `$${m.price}` : '?'}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
           {tc.name === 'get_portfolio' && (() => {
-            const r = tc.result as { budgetRemainingUSDC?: string; dailySpendUSDC?: string; openPositions?: Array<{ market: string; outcome: string; shares: string }> } | undefined;
+            const r = tc.result as { budgetRemainingUSDC?: string; dailySpendUSDC?: string; openPositions?: Array<{ market: string; outcome: string; shares: string }>; hyperliquid?: { usdc: string; balances: Array<{ coin: string; total: string }> } | null } | undefined;
             return (
               <div style={{ marginTop: 8, fontSize: 12, color: '#a0aec0' }}>
                 <p>Budget remaining: <strong style={{ color: '#e2e8f0' }}>${r?.budgetRemainingUSDC}</strong></p>
                 <p>Today's spend: <strong style={{ color: '#e2e8f0' }}>${r?.dailySpendUSDC}</strong></p>
                 {r?.openPositions && r.openPositions.length > 0 && (
                   <div style={{ marginTop: 6 }}>
-                    <p style={{ color: '#6b7280', marginBottom: 4 }}>Open positions:</p>
+                    <p style={{ color: '#6b7280', marginBottom: 4 }}>Polymarket positions:</p>
                     {r.openPositions.map((p, i) => (
                       <p key={i}>{p.outcome} {p.shares} shares — <span style={{ color: '#6b7280' }}>{p.market}</span></p>
+                    ))}
+                  </div>
+                )}
+                {r?.hyperliquid && (
+                  <div style={{ marginTop: 6 }}>
+                    <p style={{ color: '#6b7280', marginBottom: 4 }}>Hyperliquid spot: <strong style={{ color: '#e2e8f0' }}>${r.hyperliquid.usdc} USDC</strong></p>
+                    {r.hyperliquid.balances.map((b, i) => (
+                      <p key={i}>{b.total} {b.coin}</p>
                     ))}
                   </div>
                 )}
@@ -102,7 +127,18 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
           })()}
 
           {tc.name === 'place_trade' && (() => {
-            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; status?: string | null; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
+            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; venue?: string; status?: string | null; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; coin?: string; price?: number; size?: number; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; oid?: number; resting?: boolean; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
+            if (r?.success && r.venue === 'hyperliquid') {
+              const filled = (r.fillSize ?? 0) > 0;
+              return (
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  <p style={{ color: '#4ade80', marginBottom: 4 }}>{filled ? 'Hyperliquid order filled' : 'Hyperliquid order submitted'}</p>
+                  <p style={{ color: '#a0aec0' }}>{r.side} {filled ? r.fillSize : r.size} {r.coin} @ ${(r.fillPrice ?? r.price)?.toFixed(4)}</p>
+                  <p style={{ color: '#6b7280' }}>{r.market}</p>
+                  {r.oid != null && <p style={{ color: '#4b5563', fontFamily: 'monospace', fontSize: 11 }}>oid {r.oid}</p>}
+                </div>
+              );
+            }
             if (r?.success) {
               const isLive = r.mode === 'live';
               const liveFilled = isLive && r.status?.toLowerCase() === 'matched';

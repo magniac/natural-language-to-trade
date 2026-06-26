@@ -5,7 +5,9 @@ import { logger } from '../utils/logger';
 import { searchMarketsByKeywords, upsertMarket } from '../market/marketRepository';
 import { resolveMarket, resolveMarketById } from '../market/marketResolver';
 import { fetchGammaMarketById } from '../market/polymarketGammaClient';
-import { runPolicyEngine, type AccountState, type UsageState, type MarketState } from '../policy/policyEngine';
+import { runPolicyEngine, runHyperliquidPolicy, type AccountState, type UsageState, type MarketState } from '../policy/policyEngine';
+import { HyperliquidClient } from '../clob/hyperliquidClient';
+import { hasHlCreds } from '../utils/hyperliquidKeyStore';
 import { simulateTrade, createSimulatorState } from '../simulator/paperTradingSimulator';
 import { buildNormalizedOrder } from '../clob/orderBuilder';
 import { ClobTradingClientImpl } from '../clob/clobTradingClient';
@@ -126,8 +128,22 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'search_hyperliquid_markets',
+      description: 'Search Hyperliquid SPOT tokens by name/symbol (e.g. "HYPE", "PURR"). Returns matching coins with current USD prices. Use this for crypto spot trades, NOT for prediction markets.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Token name or symbol, e.g. "HYPE"' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'get_portfolio',
-      description: 'Get the current portfolio: budget remaining, open positions, and recent orders.',
+      description: 'Get the current portfolio across both venues: budget remaining, Polymarket positions, Hyperliquid spot balances, and recent orders.',
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -135,20 +151,25 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'place_trade',
-      description: 'Place a trade. Only call this when the user has explicitly confirmed the exact market. If search returns multiple markets, ask the user which one they mean BEFORE calling this tool.',
+      description: 'Place a trade on Polymarket (prediction markets) OR Hyperliquid (crypto spot). Set venue accordingly. Only call after the user has explicitly confirmed the exact market/coin, side, and amount.',
       parameters: {
         type: 'object',
         properties: {
-          marketQuery: { type: 'string', description: 'Exact full market title from search results — copy it verbatim' },
-          outcome: { type: 'string', enum: ['YES', 'NO'], description: 'Which outcome token to trade' },
+          venue: { type: 'string', enum: ['polymarket', 'hyperliquid'], description: 'polymarket = prediction markets (YES/NO outcomes); hyperliquid = crypto spot (e.g. buy HYPE). Defaults to polymarket.' },
+          // Polymarket fields
+          marketQuery: { type: 'string', description: 'POLYMARKET: exact full market title from search results — copy it verbatim' },
+          outcome: { type: 'string', enum: ['YES', 'NO'], description: 'POLYMARKET: which outcome token to trade' },
+          limitPrice: { type: 'number', description: 'POLYMARKET: limit price 0.01–0.99; omit to use current market price' },
+          // Hyperliquid fields
+          coin: { type: 'string', description: 'HYPERLIQUID: token symbol to trade, e.g. "HYPE" (the USDC pair is used)' },
+          // Shared
           side: { type: 'string', enum: ['BUY', 'SELL'], description: 'BUY or SELL' },
-          maxSpendUSDC: { type: 'number', description: 'Max USDC to spend. Required for BUY orders.' },
-          maxFraction: { type: 'number', description: 'For SELL only: fraction of current position to sell (1.0 = sell all, 0.5 = sell half). Use this instead of maxSpendUSDC for sells.' },
-          limitPrice: { type: 'number', description: 'Limit price 0.01–0.99; omit to use current market price' },
+          maxSpendUSDC: { type: 'number', description: 'Max USDC to spend. Required for BUY orders (both venues).' },
+          maxFraction: { type: 'number', description: 'For SELL only: fraction of the current position to sell (1.0 = all, 0.5 = half). Use instead of maxSpendUSDC for sells.' },
           rationale: { type: 'string', description: 'Brief reason for the trade' },
           confidence: { type: 'number', description: 'Confidence 0–1 (e.g. 0.8 = 80%)' },
         },
-        required: ['marketQuery', 'outcome', 'side', 'rationale', 'confidence'],
+        required: ['side', 'rationale', 'confidence'],
       },
     },
   },
@@ -157,12 +178,19 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 function buildSystemPrompt(policy: StoredPolicy, accountState: AccountState, liveMode: boolean): string {
   const t = policy.policyJson.trading;
   const expiresAt = new Date(policy.policyJson.expiresAt).toLocaleDateString();
-  return `You are a helpful prediction market trading assistant for the Polymarket Agent demo.
+  const venues = policy.policyJson.allowedVenues ?? ['polymarket'];
+  const hl = policy.policyJson.hyperliquid;
+  const hlEnabled = venues.includes('hyperliquid') && !!hl;
+  return `You are a helpful trading assistant for an agent that trades on two venues: Polymarket (prediction markets) and Hyperliquid (crypto spot).
 
 You can:
-- Search for markets and explain what they mean
-- Check the user's current portfolio and positions
-- Place ${liveMode ? 'LIVE trades (real money on Polymarket)' : 'paper trades (simulated, no real money)'} when the user asks you to
+- Search for markets/coins and explain what they mean
+- Check the user's current portfolio and positions across both venues
+- Place ${liveMode ? 'LIVE trades (real money)' : 'paper trades (simulated, no real money)'} when the user asks you to
+
+Venues — pick the right one:
+- POLYMARKET: prediction markets with YES/NO outcomes (elections, sports, events). Use search_markets, then place_trade with venue="polymarket", marketQuery, outcome (YES/NO).
+- HYPERLIQUID: crypto SPOT tokens bought/sold with USDC (e.g. BTC, HYPE, PURR). ${hlEnabled ? `Use search_hyperliquid_markets, then place_trade with venue="hyperliquid", coin, side, maxSpendUSDC. Hyperliquid is mainnet/real-money and requires Live mode.${hl && hl.allowedCoins.length ? ` Allowed coins: ${hl.allowedCoins.join(', ')}.` : ''}` : 'NOT enabled by this policy — tell the user Hyperliquid is not authorized; they must re-sign the policy enabling it.'}
 
 Agent policy (signed by user, enforced deterministically):
 - Budget remaining RIGHT NOW: $${accountState.budgetRemainingUSDC.toFixed(2)} of $${t.maxBudgetUSDC.toFixed(2)} total
@@ -275,10 +303,8 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
   const todayMs = today.getTime();
 
   // Refresh live fills from the CLOB so positions reflect executed trades (no-op for paper).
-  if (process.env.ENABLE_LIVE_TRADING === 'true') {
-    try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
-    catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
-  }
+  try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
+  catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
   repairMatchedFillsForAgent(db, agentWalletId);
 
   const totalSpent = (db.prepare(`
@@ -303,6 +329,20 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
     ORDER BY buy_cost DESC LIMIT 10
   `).all(agentWalletId) as Array<{ market_title: string; outcome: string; net_shares: number; buy_cost: number }>;
 
+  // Hyperliquid spot balances (live, from the master account) when configured.
+  let hyperliquid: { usdc: string; balances: { coin: string; total: string }[] } | null = null;
+  if (hasHlCreds(agentWalletId)) {
+    try {
+      const state = await new HyperliquidClient().getSpotState(agentWalletId);
+      hyperliquid = {
+        usdc: state.usdc.toFixed(2),
+        balances: state.balances.filter(b => b.coin !== 'USDC').map(b => ({ coin: b.coin, total: String(b.total) })),
+      };
+    } catch (err) {
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid balance fetch failed');
+    }
+  }
+
   const t = policy.policyJson.trading;
   return {
     budgetRemainingUSDC: Math.max(0, t.maxBudgetUSDC - totalSpent).toFixed(2),
@@ -314,6 +354,7 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
       shares: p.net_shares.toFixed(2),
       costBasis: p.buy_cost.toFixed(2),
     })),
+    hyperliquid,
   };
 }
 
@@ -387,7 +428,7 @@ async function toolPlaceTrade(
   const tokenId = args.outcome === 'YES' ? resolvedMarket.yesTokenId : resolvedMarket.noTokenId;
   const db1 = getDb();
   const modeRow = db1.prepare('SELECT paper_mode FROM agent_wallets WHERE id = ?').get(agentWalletId) as { paper_mode: number } | undefined;
-  const liveMode = process.env.ENABLE_LIVE_TRADING === 'true' && modeRow?.paper_mode === 0;
+  const liveMode = modeRow?.paper_mode === 0;
 
   // Best market price for the side. Prefer the LIVE CLOB top-of-book (the cached gamma price is
   // often stale, which is why limit orders were resting unfilled). Fall back to cache on failure.
@@ -547,12 +588,8 @@ async function toolPlaceTrade(
     };
   }
 
-  // Live trading path
-  const maxLive = parseFloat(process.env.MAX_GLOBAL_LIVE_ORDER_USDC ?? '1');
+  // Live trading path. Order size is bounded by the signed policy (already checked above).
   const orderValueUsdc = intent.maxSpendUSDC ?? (intent.size ? intent.size * intent.limitPrice : 0);
-  if (orderValueUsdc > maxLive) {
-    return { success: false, error: `Order value $${orderValueUsdc.toFixed(2)} exceeds the live cap ($${maxLive}). Lower the amount.` };
-  }
 
   const clobClient = new ClobTradingClientImpl();
   let liveTickSize: number;
@@ -638,6 +675,100 @@ async function toolPlaceTrade(
   };
 }
 
+async function toolSearchHyperliquid(args: { query: string }): Promise<unknown> {
+  try {
+    const results = await new HyperliquidClient().searchSpotMarkets(args.query ?? '');
+    return {
+      found: results.length,
+      venue: 'hyperliquid',
+      markets: results.map(r => ({ title: `${r.coin}/USDC`, coin: r.coin, price: r.price })),
+    };
+  } catch (err) {
+    return { found: 0, markets: [], error: err instanceof Error ? err.message : 'Hyperliquid search failed' };
+  }
+}
+
+async function toolPlaceHyperliquidTrade(
+  args: { coin?: string; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number },
+  policy: StoredPolicy,
+  agentWalletId: string,
+): Promise<unknown> {
+  logger.info({ agentWalletId, args }, 'place_trade (hyperliquid) invoked');
+  const coin = (args.coin ?? '').trim();
+  if (!coin) return { success: false, error: 'No coin specified for the Hyperliquid trade.' };
+  if (args.side === 'BUY' && !args.maxSpendUSDC) {
+    return { success: false, needsAmount: true, error: 'Amount not specified. Ask how much USDC to spend.' };
+  }
+  if (args.side === 'SELL' && !args.maxSpendUSDC && args.maxFraction === undefined) {
+    return { success: false, needsAmount: true, error: 'Sell quantity not specified — use maxFraction (1.0 = sell all).' };
+  }
+  if (!hasHlCreds(agentWalletId)) {
+    return { success: false, error: 'No Hyperliquid API wallet configured. Add it in Agent Setup → Hyperliquid.' };
+  }
+
+  const db = getDb();
+  const today = new Date(); today.setHours(0, 0, 0, 0); const todayMs = today.getTime();
+  const totalSpent = (db.prepare("SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as t FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?").get(agentWalletId) as { t: number }).t;
+  const dailySpend = (db.prepare("SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as t FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?").get(agentWalletId, todayMs) as { t: number }).t;
+  const openOrderCount = (db.prepare("SELECT COUNT(*) as c FROM orders WHERE agent_wallet_id=? AND status IN ('open','pending','partially_filled')").get(agentWalletId) as { c: number }).c;
+
+  const accountState: AccountState = {
+    budgetRemainingUSDC: policy.policyJson.trading.maxBudgetUSDC - totalSpent,
+    dailySpendUSDC: dailySpend, openOrderCount, positionSizeByMarket: {},
+  };
+  const usageState: UsageState = {
+    llmRequestsLastHour: 0, llmSpendTodayUSDC: 0,
+    policyActive: policy.status === 'active',
+    policyExpired: policy.expiresAt.getTime() < Date.now(),
+    sessionKeyRevoked: policy.status === 'revoked',
+    intentNonceUsed: false,
+  };
+
+  const orderValueUsdc = args.maxSpendUSDC ?? 0; // fractional sells size from balance; budget check is BUY-only
+  const decision = runHyperliquidPolicy({ policy: policy.policyJson, coin, side: args.side, orderValueUsdc, accountState, usageState });
+  if (!decision.allowed) {
+    logger.info({ agentWalletId, reasons: decision.reasons }, 'place_trade (hyperliquid): policy denied');
+    return { success: false, policyDenied: true, reasons: decision.reasons, market: `${coin} (Hyperliquid spot)` };
+  }
+
+  // Hyperliquid trades are real mainnet orders — require Live mode.
+  const liveMode = (db.prepare('SELECT paper_mode FROM agent_wallets WHERE id=?').get(agentWalletId) as { paper_mode: number } | undefined)?.paper_mode === 0;
+  if (!liveMode) {
+    return { success: false, error: 'Hyperliquid trades execute on mainnet with real funds. Switch the agent to Live mode to trade on Hyperliquid.' };
+  }
+
+  let result;
+  try {
+    result = await new HyperliquidClient().placeSpotOrder(agentWalletId, {
+      coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction,
+    });
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Hyperliquid order failed', venue: 'hyperliquid' };
+  }
+
+  // Record into the shared intents/orders/fills tables, tagged venue='hyperliquid'.
+  const tradeIntentId = uuidv4(); const orderId = uuidv4(); const now = Date.now();
+  db.prepare("INSERT INTO trade_intents (id, user_id, agent_wallet_id, policy_id, session_key_address, raw_input, structured_intent_json, status, venue, created_at) VALUES (?,?,?,?,?,?,?,'executed','hyperliquid',?)")
+    .run(tradeIntentId, policy.userId, agentWalletId, policy.id, policy.sessionKeyAddress, `chat: ${args.side} ${coin} (HL spot)`, JSON.stringify({ coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction }), now);
+  const status = result.success ? (result.filledSize > 0 ? 'filled' : 'open') : 'failed';
+  db.prepare("INSERT INTO orders (id, trade_intent_id, agent_wallet_id, market_id, token_id, side, price, size, order_type, expiration, clob_order_id, idempotency_key, status, venue, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,'IOC',NULL,?,?,?,'hyperliquid',?,?)")
+    .run(orderId, tradeIntentId, agentWalletId, result.pair, result.coin, args.side, result.price, result.size, result.oid != null ? String(result.oid) : null, `hl-${orderId}`, status, now, now);
+  if (result.success && result.filledSize > 0) {
+    db.prepare("INSERT INTO fills (id, order_id, clob_trade_id, price, size, side, fee, created_at, raw_json) VALUES (?,?,?,?,?,?,0,?,?)")
+      .run(uuidv4(), orderId, `HL-${result.oid ?? orderId}`, result.avgPrice ?? result.price, result.filledSize, args.side, now, JSON.stringify(result));
+  }
+
+  writeAudit({ userId: policy.userId, agentWalletId, policyId: policy.id, actorType: 'agent', actorId: 'chat', action: result.success ? 'order.submitted' : 'order.failed', details: { venue: 'hyperliquid', coin: result.coin, side: args.side, oid: result.oid, filledSize: result.filledSize, mode: 'live', source: 'chat' } });
+
+  if (!result.success) return { success: false, error: result.error ?? 'Hyperliquid order did not fill', venue: 'hyperliquid' };
+  return {
+    success: true, mode: 'live', venue: 'hyperliquid',
+    market: `${result.coin}/USDC (Hyperliquid spot)`, side: args.side, coin: result.coin,
+    fillPrice: result.avgPrice ?? result.price, fillSize: result.filledSize,
+    price: result.price, size: result.size, oid: result.oid, resting: result.resting,
+  };
+}
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -647,9 +778,18 @@ async function executeTool(
   switch (name) {
     case 'search_markets':
       return toolSearchMarkets(args as { query: string });
+    case 'search_hyperliquid_markets':
+      return toolSearchHyperliquid(args as { query: string });
     case 'get_portfolio':
       return toolGetPortfolio(agentWalletId, policy);
     case 'place_trade':
+      if ((args as { venue?: string }).venue === 'hyperliquid') {
+        return toolPlaceHyperliquidTrade(
+          args as { coin?: string; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number },
+          policy,
+          agentWalletId,
+        );
+      }
       return toolPlaceTrade(
         args as { marketQuery: string; outcome: 'YES' | 'NO'; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; limitPrice?: number },
         policy,
@@ -696,7 +836,7 @@ export async function runAgentChat(
   };
 
   const agentRow = db.prepare('SELECT paper_mode FROM agent_wallets WHERE id = ?').get(agentWalletId) as { paper_mode: number } | undefined;
-  const liveMode = process.env.ENABLE_LIVE_TRADING === 'true' && agentRow?.paper_mode === 0;
+  const liveMode = agentRow?.paper_mode === 0;
 
   const client = new OpenAI({ baseURL: OPENROUTER_BASE, apiKey });
   const systemPrompt = buildSystemPrompt(policy, accountState, liveMode);

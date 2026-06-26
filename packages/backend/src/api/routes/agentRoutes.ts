@@ -12,6 +12,8 @@ import { getContractConfig } from '@polymarket/clob-client-v2';
 import { startLoop, stopLoop, getLoopStatusAndDecisions } from '../../agent/autonomousLoop';
 import { storeLlmApiKey, hasLlmApiKey, deleteLlmApiKey } from '../../utils/llmKeyStore';
 import { storeRelayerCreds, hasRelayerCreds, deleteRelayerCreds, resolveRelayerCreds } from '../../utils/relayerKeyStore';
+import { storeHlCreds, hasHlCreds, deleteHlCreds } from '../../utils/hyperliquidKeyStore';
+import { HyperliquidClient } from '../../clob/hyperliquidClient';
 import { logger } from '../../utils/logger';
 import { z } from 'zod';
 import type { AgentPolicy } from '../../types/policy';
@@ -235,22 +237,76 @@ router.delete('/:agentId/relayer-key', (req, res) => {
   return res.json({ status: 'deleted' });
 });
 
+// ─── Hyperliquid API wallet (signer) + balance ───────────────────────────────
+// The API wallet only signs; the user's connected main wallet is the master account that
+// holds funds. The API wallet cannot withdraw (enforced by Hyperliquid).
+
+router.post('/:agentId/hyperliquid-key', (req, res) => {
+  const { agentId } = req.params;
+  const { apiWalletAddress, privateKey } = req.body as { apiWalletAddress?: string; privateKey?: string };
+  if (!privateKey || typeof privateKey !== 'string') {
+    return res.status(400).json({ error: 'privateKey required' });
+  }
+  if (!apiWalletAddress || !ethers.isAddress(apiWalletAddress)) {
+    return res.status(400).json({ error: 'Valid apiWalletAddress required' });
+  }
+  // The secret key must derive to the API wallet address.
+  let derived: string;
+  try {
+    derived = new ethers.Wallet(privateKey.trim()).address;
+  } catch {
+    return res.status(400).json({ error: 'Invalid private key' });
+  }
+  if (derived.toLowerCase() !== apiWalletAddress.trim().toLowerCase()) {
+    return res.status(400).json({ error: `Key does not match address — this key belongs to ${derived}` });
+  }
+  const db = getDb();
+  if (!db.prepare('SELECT id FROM agent_wallets WHERE id = ?').get(agentId)) {
+    return res.status(404).json({ error: 'Agent wallet not found' });
+  }
+  storeHlCreds(agentId, { apiWalletAddress: derived, privateKey: privateKey.trim() });
+  writeAudit({ agentWalletId: agentId, actorType: 'user', actorId: 'user', action: 'agent.create', details: { sub: 'hyperliquid-key-stored', apiWalletAddress: derived } });
+  return res.json({ status: 'stored', apiWalletAddress: derived });
+});
+
+router.get('/:agentId/hyperliquid-key/status', (req, res) => {
+  return res.json({ hasKey: hasHlCreds(req.params.agentId) });
+});
+
+router.delete('/:agentId/hyperliquid-key', (req, res) => {
+  deleteHlCreds(req.params.agentId);
+  return res.json({ status: 'deleted' });
+});
+
+router.get('/:agentId/hyperliquid-balance', async (req, res) => {
+  const { agentId } = req.params;
+  const db = getDb();
+  if (!db.prepare('SELECT id FROM agent_wallets WHERE id = ?').get(agentId)) {
+    return res.status(404).json({ error: 'Agent not found' });
+  }
+  try {
+    const state = await new HyperliquidClient().getSpotState(agentId);
+    return res.json(state);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Hyperliquid read failed';
+    logger.warn({ agentId, err }, 'hyperliquid-balance failed');
+    return res.status(502).json({ error: msg });
+  }
+});
+
 // ─── Trading mode (paper / live) ─────────────────────────────────────────────
 
 router.get('/:agentId/mode', (req, res) => {
   const db = getDb();
   const row = db.prepare('SELECT paper_mode FROM agent_wallets WHERE id = ?').get(req.params.agentId) as { paper_mode: number } | undefined;
   if (!row) return res.status(404).json({ error: 'Agent not found' });
-  const serverLiveEnabled = process.env.ENABLE_LIVE_TRADING === 'true';
-  return res.json({ paperMode: row.paper_mode === 1, serverLiveEnabled });
+  // Live trading is always available; the per-agent toggle decides paper vs live.
+  return res.json({ paperMode: row.paper_mode === 1, serverLiveEnabled: true });
 });
 
 router.patch('/:agentId/mode', (req, res) => {
   const { paperMode } = req.body as { paperMode: boolean };
   if (typeof paperMode !== 'boolean') return res.status(400).json({ error: 'paperMode (boolean) required' });
-  if (!paperMode && process.env.ENABLE_LIVE_TRADING !== 'true') {
-    return res.status(403).json({ error: 'Live trading is not enabled on this server (ENABLE_LIVE_TRADING=false)' });
-  }
   const db = getDb();
   db.prepare('UPDATE agent_wallets SET paper_mode = ?, updated_at = ? WHERE id = ?')
     .run(paperMode ? 1 : 0, Date.now(), req.params.agentId);

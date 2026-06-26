@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS trade_intents (
   raw_input TEXT NOT NULL,
   structured_intent_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
+  venue TEXT NOT NULL DEFAULT 'polymarket',
   created_at INTEGER NOT NULL
 );
 
@@ -120,6 +121,7 @@ CREATE TABLE IF NOT EXISTS orders (
   clob_order_id TEXT,
   idempotency_key TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT 'pending',
+  venue TEXT NOT NULL DEFAULT 'polymarket',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

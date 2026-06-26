@@ -44,7 +44,3 @@ export async function requireValidSession(req: Request, res: Response, next: Nex
   (req as Request & { policy: typeof result.policy }).policy = result.policy;
   next();
 }
-
-export function isLiveTradingEnabled(): boolean {
-  return process.env.ENABLE_LIVE_TRADING === 'true';
-}

@@ -2,7 +2,7 @@ import React from 'react';
 import { ethers } from 'ethers';
 import { api } from '../lib/api';
 import { signPolicyEIP712 } from '../lib/wallet';
-import { saveSession, saveAgentWallet, loadAgentWallet, loadSession, getSessionStatus, clearAgentWallet, clearSession } from '../lib/sessionSigner';
+import { saveSession, saveAgentWallet, loadAgentWallet, loadSession, getSessionStatus, clearAgentWallet, clearSession, type PersistedAgentWallet } from '../lib/sessionSigner';
 import Card from './Card';
 import Button from './Button';
 import StatusBadge from './StatusBadge';
@@ -47,6 +47,11 @@ export default function AgentSetup({ wallet }: Props) {
   // Allowed operations
   const [allowBuy, setAllowBuy] = React.useState(persisted?.allowBuy ?? true);
   const [allowSell, setAllowSell] = React.useState(persisted?.allowSell ?? true);
+  // Hyperliquid venue (spot)
+  const [allowHyperliquid, setAllowHyperliquid] = React.useState(persisted?.allowHyperliquid ?? false);
+  const [hlAllowedCoins, setHlAllowedCoins] = React.useState(persisted?.hlAllowedCoins ?? '');
+  const [hlMaxOrder, setHlMaxOrder] = React.useState(persisted?.hlMaxOrder ?? '1');
+  const [hlSlippageBps, setHlSlippageBps] = React.useState(persisted?.hlSlippageBps ?? '100');
   const [signedPolicyId, setSignedPolicyId] = React.useState<string | null>(persisted?.policyId ?? null);
   const [clobStatus, setClobStatus] = React.useState<'unknown' | 'none' | 'active' | 'deriving' | 'error'>('unknown');
   const [clobDerivedAt, setClobDerivedAt] = React.useState<string | null>(null);
@@ -59,6 +64,16 @@ export default function AgentSetup({ wallet }: Props) {
   const [relayerAddrInput, setRelayerAddrInput] = React.useState('');
   const [relayerKeySaving, setRelayerKeySaving] = React.useState(false);
   const [relayerKeyError, setRelayerKeyError] = React.useState<string | null>(null);
+  // Hyperliquid API wallet + deposit
+  const [hlKeyStatus, setHlKeyStatus] = React.useState<'unknown' | 'none' | 'active'>('unknown');
+  const [hlAddrInput, setHlAddrInput] = React.useState('');
+  const [hlKeyInput, setHlKeyInput] = React.useState('');
+  const [hlKeySaving, setHlKeySaving] = React.useState(false);
+  const [hlKeyError, setHlKeyError] = React.useState<string | null>(null);
+  const [hlBalance, setHlBalance] = React.useState<{ usdc: number; balances: { coin: string; total: number }[] } | null>(null);
+  const [hlDepositAmount, setHlDepositAmount] = React.useState('10');
+  const [hlDepositError, setHlDepositError] = React.useState<string | null>(null);
+  const [hlDepositing, setHlDepositing] = React.useState(false);
   const [paperMode, setPaperMode] = React.useState(true);
   const [serverLiveEnabled, setServerLiveEnabled] = React.useState(false);
   const [modeSaving, setModeSaving] = React.useState(false);
@@ -80,6 +95,85 @@ export default function AgentSetup({ wallet }: Props) {
   const [provisionError, setProvisionError] = React.useState<string | null>(null);
   const [myWalletPusd, setMyWalletPusd] = React.useState<number | null>(null);
 
+  const activePolicyId = signedPolicyId ?? agent?.policyId ?? null;
+  const isEditingExistingPolicy = Boolean(activePolicyId) && step === 'configuring';
+
+  function persistCurrentAgentWallet(
+    nextStep: PersistedAgentWallet['step'],
+    overrides: Partial<PersistedAgentWallet> = {},
+  ) {
+    if (!agent) return;
+    saveAgentWallet({
+      agentWalletId: agent.agentWalletId,
+      address: agent.address,
+      proxyWalletAddress: agent.proxyWalletAddress,
+      step: nextStep,
+      policyId: activePolicyId ?? undefined,
+      budget,
+      maxOrder,
+      dailyLimit,
+      maxOpenOrders,
+      expiryDays,
+      minLiquidityUSDC,
+      maxSpreadBps,
+      nearResolutionHours,
+      maxPrice,
+      allowBuy,
+      allowSell,
+      allowHyperliquid,
+      hlAllowedCoins,
+      hlMaxOrder,
+      hlSlippageBps,
+      ...overrides,
+    });
+  }
+
+  function beginPolicyEdit() {
+    if (!agent) return;
+    setError(null);
+    setStep('configuring');
+    persistCurrentAgentWallet('configuring');
+  }
+
+  function cancelPolicyEdit() {
+    if (!agent) return;
+    setError(null);
+    setStep('done');
+    persistCurrentAgentWallet('done');
+  }
+
+  React.useEffect(() => {
+    if (!agent?.agentWalletId) return;
+    let cancelled = false;
+
+    api.getAgent(agent.agentWalletId)
+      .then(serverAgent => {
+        if (cancelled) return;
+        const serverProxyWallet = 'proxy_wallet_address' in serverAgent
+          ? serverAgent.proxy_wallet_address ?? undefined
+          : agent.proxyWalletAddress;
+        const normalizedAgent = {
+          ...agent,
+          address: serverAgent.address,
+          status: serverAgent.status,
+          proxyWalletAddress: serverProxyWallet,
+        };
+        setAgent(normalizedAgent);
+
+        const persistedAgent = loadAgentWallet();
+        if (persistedAgent?.agentWalletId === agent.agentWalletId) {
+          saveAgentWallet({
+            ...persistedAgent,
+            address: serverAgent.address,
+            proxyWalletAddress: serverProxyWallet,
+          });
+        }
+      })
+      .catch(() => {});
+
+    return () => { cancelled = true; };
+  }, [agent?.agentWalletId]);
+
   // Load LLM key status when agent is known
   React.useEffect(() => {
     if (!agent?.agentWalletId || step !== 'done') return;
@@ -91,6 +185,10 @@ export default function AgentSetup({ wallet }: Props) {
       .then(r => r.json())
       .then((d: { hasKey: boolean }) => setRelayerKeyStatus(d.hasKey ? 'active' : 'none'))
       .catch(() => setRelayerKeyStatus('unknown'));
+    fetch(`/api/agents/${agent.agentWalletId}/hyperliquid-key/status`)
+      .then(r => r.json())
+      .then((d: { hasKey: boolean }) => { setHlKeyStatus(d.hasKey ? 'active' : 'none'); if (d.hasKey) void refreshHlBalance(); })
+      .catch(() => setHlKeyStatus('unknown'));
   }, [agent?.agentWalletId, step]);
 
   // The agent that matters for mode/trades is the one in the active session,
@@ -262,8 +360,32 @@ export default function AgentSetup({ wallet }: Props) {
       });
       const data = await r.json() as { success?: boolean; address?: string; error?: string };
       if (!r.ok || !data.success) throw new Error(data.error ?? 'Import failed');
+      const importedAddress = data.address;
+      if (!importedAddress) throw new Error('Import succeeded but no address was returned');
       // Changing the EOA invalidates the previously provisioned proxy wallet.
-      setAgent(prev => prev ? { ...prev, address: data.address!, proxyWalletAddress: undefined } : prev);
+      setAgent(prev => prev ? { ...prev, address: importedAddress, proxyWalletAddress: undefined } : prev);
+      saveAgentWallet({
+        agentWalletId: agent.agentWalletId,
+        address: importedAddress,
+        proxyWalletAddress: undefined,
+        step: step === 'done' ? 'done' : 'configuring',
+        policyId: activePolicyId ?? undefined,
+        budget,
+        maxOrder,
+        dailyLimit,
+        maxOpenOrders,
+        expiryDays,
+        minLiquidityUSDC,
+        maxSpreadBps,
+        nearResolutionHours,
+        maxPrice,
+        allowBuy,
+        allowSell,
+        allowHyperliquid,
+        hlAllowedCoins,
+        hlMaxOrder,
+        hlSlippageBps,
+      });
       setImportKeyInput('');
       setClobStatus('none');
       void refreshFundStatus();
@@ -320,7 +442,7 @@ export default function AgentSetup({ wallet }: Props) {
       const newAgent = { agentWalletId: result.agentWalletId, address: result.address, status: 'active' };
       setAgent(newAgent);
       setStep('configuring');
-      saveAgentWallet({ agentWalletId: result.agentWalletId, address: result.address, proxyWalletAddress: undefined, step: 'configuring', budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell });
+      saveAgentWallet({ agentWalletId: result.agentWalletId, address: result.address, proxyWalletAddress: undefined, step: 'configuring', budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create agent');
     } finally {
@@ -374,6 +496,15 @@ export default function AgentSetup({ wallet }: Props) {
           nearResolutionHours: nearResolutionHours !== '' ? parseFloat(nearResolutionHours) : null,
           minExpirationSeconds: 60,
           maxExpirationSeconds: 3600,
+        },
+        allowedVenues: [
+          'polymarket' as const,
+          ...(allowHyperliquid ? ['hyperliquid' as const] : []),
+        ],
+        hyperliquid: {
+          maxOrderSizeUSDC: parseFloat(hlMaxOrder) || 1,
+          allowedCoins: hlAllowedCoins.split(',').map(c => c.trim().toUpperCase()).filter(Boolean),
+          maxSlippageBps: parseInt(hlSlippageBps) || 100,
         },
       };
 
@@ -431,7 +562,7 @@ export default function AgentSetup({ wallet }: Props) {
       });
 
       // Persist agent wallet state so tab switches don't reset the UI
-      saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, proxyWalletAddress: agent.proxyWalletAddress, step: 'done', policyId: data.policyId, budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell });
+      saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, proxyWalletAddress: agent.proxyWalletAddress, step: 'done', policyId: data.policyId, budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
 
       setStep('done');
 
@@ -536,6 +667,80 @@ export default function AgentSetup({ wallet }: Props) {
     setRelayerAddrInput('');
   }
 
+  // ── Hyperliquid: API wallet + deposit ──
+  // Hyperliquid Bridge2 on Arbitrum. Send native USDC (Circle's, NOT USDC.e); minimum $5.
+  const HL_BRIDGE = '0x2df1c51e09aecf9cacb7bc98cb1742757f163df7';
+  const ARB_USDC = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831';
+  const ARBITRUM_CHAIN = '0xa4b1';
+
+  async function refreshHlBalance() {
+    if (!agent) return;
+    try {
+      const r = await fetch(`/api/agents/${agent.agentWalletId}/hyperliquid-balance`);
+      if (r.ok) setHlBalance(await r.json() as { usdc: number; balances: { coin: string; total: number }[] });
+    } catch { /* ignore */ }
+  }
+
+  async function saveHlKey() {
+    if (!agent || !hlKeyInput.trim() || !hlAddrInput.trim()) return;
+    setHlKeySaving(true); setHlKeyError(null);
+    try {
+      let derived: string;
+      try { derived = new ethers.Wallet(hlKeyInput.trim()).address; } catch { throw new Error('Invalid private key'); }
+      if (derived.toLowerCase() !== hlAddrInput.trim().toLowerCase()) {
+        throw new Error(`Key does not match address — it belongs to ${derived}`);
+      }
+      const r = await fetch(`/api/agents/${agent.agentWalletId}/hyperliquid-key`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiWalletAddress: hlAddrInput.trim(), privateKey: hlKeyInput.trim() }),
+      });
+      const data = await r.json() as { status?: string; error?: string };
+      if (!r.ok || data.status !== 'stored') throw new Error(data.error ?? 'Failed to save');
+      setHlKeyStatus('active'); setHlKeyInput(''); setHlAddrInput('');
+      void refreshHlBalance();
+    } catch (err) {
+      setHlKeyError(err instanceof Error ? err.message : 'Failed to save key');
+    } finally {
+      setHlKeySaving(false);
+    }
+  }
+
+  async function removeHlKey() {
+    if (!agent) return;
+    await fetch(`/api/agents/${agent.agentWalletId}/hyperliquid-key`, { method: 'DELETE' });
+    setHlKeyStatus('none'); setHlKeyInput(''); setHlAddrInput(''); setHlBalance(null);
+  }
+
+  async function depositToHyperliquid() {
+    if (!agent || wallet.status !== 'connected') return;
+    setHlDepositError(null); setHlDepositing(true);
+    try {
+      const amt = parseFloat(hlDepositAmount);
+      if (!(amt >= 5)) throw new Error('Hyperliquid requires a minimum deposit of 5 USDC.');
+      await wallet.provider.send('wallet_switchEthereumChain', [{ chainId: ARBITRUM_CHAIN }]);
+      const signer = await wallet.provider.getSigner();
+      const usdc = new ethers.Contract(
+        ARB_USDC,
+        ['function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)'],
+        signer,
+      );
+      const bal = await usdc.balanceOf(await signer.getAddress()) as bigint;
+      const amount = ethers.parseUnits(hlDepositAmount, 6);
+      if (bal < amount) {
+        const have = parseFloat(ethers.formatUnits(bal, 6)).toFixed(2);
+        throw new Error(`Your wallet has only $${have} native USDC on Arbitrum. Bridge in native USDC (not USDC.e) first.`);
+      }
+      // Funds credit your Hyperliquid master account (this connected wallet) in under a minute.
+      const tx = await (usdc.transfer(HL_BRIDGE, amount) as Promise<ethers.TransactionResponse>);
+      await tx.wait();
+      setTimeout(() => void refreshHlBalance(), 8000);
+    } catch (err) {
+      setHlDepositError(err instanceof Error ? err.message : 'Deposit failed');
+    } finally {
+      setHlDepositing(false);
+    }
+  }
+
   async function pauseAgent() {
     if (!agent) return;
     await api.pauseAgent(agent.agentWalletId);
@@ -607,7 +812,21 @@ export default function AgentSetup({ wallet }: Props) {
             )}
           </div>
 
-          <h4 style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0', marginBottom: 16 }}>Configure Trading Policy</h4>
+          <h4 style={{ fontSize: 14, fontWeight: 600, color: '#e2e8f0', marginBottom: 16 }}>
+            {isEditingExistingPolicy ? 'Edit Trading Policy' : 'Configure Trading Policy'}
+          </h4>
+
+          {isEditingExistingPolicy && (
+            <div style={{
+              background: '#1e3a5f33', border: '1px solid #1e3a5f',
+              borderRadius: 8, padding: '12px 16px', marginBottom: 20,
+            }}>
+              <p style={{ fontSize: 13, color: '#93c5fd', lineHeight: 1.6 }}>
+                Adjust the limits below, then re-sign to replace the current active policy.
+                The existing policy remains active until the new signature is accepted.
+              </p>
+            </div>
+          )}
 
           {/* Section: Budget & Limits */}
           <p style={{ fontSize: 11, color: '#4b5563', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 }}>Budget & Limits</p>
@@ -683,6 +902,63 @@ export default function AgentSetup({ wallet }: Props) {
             ))}
           </div>
 
+          {/* Section: Trading Venues */}
+          <p style={{ fontSize: 11, color: '#4b5563', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 }}>Trading Venues</p>
+          <div style={{ marginBottom: 20, padding: '12px 14px', background: '#0f1117', borderRadius: 8, border: '1px solid #2d3748' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: '#a0aec0' }}>
+              <input type="checkbox" checked style={{ accentColor: '#6366f1', width: 16, height: 16 }} disabled readOnly />
+              Polymarket (prediction markets) — always enabled
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: '#a0aec0', marginTop: 10 }}>
+              <input
+                type="checkbox"
+                checked={allowHyperliquid}
+                onChange={e => {
+                  setAllowHyperliquid(e.target.checked);
+                  if (agent) saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, step: 'configuring', allowHyperliquid: e.target.checked, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
+                }}
+                style={{ accentColor: '#6366f1', width: 16, height: 16 }}
+              />
+              Hyperliquid (crypto spot, mainnet — real funds)
+            </label>
+            {allowHyperliquid && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
+                {([
+                  { label: 'HL Max Order (USDC)', value: hlMaxOrder, set: setHlMaxOrder, key: 'hlMaxOrder', placeholder: 'e.g. 1', hint: 'Per HL spot order' },
+                  { label: 'HL Max Slippage (bps)', value: hlSlippageBps, set: setHlSlippageBps, key: 'hlSlippageBps', placeholder: 'e.g. 100', hint: '100 = 1%' },
+                ] as const).map(({ label, value, set, key: fieldKey, placeholder, hint }) => (
+                  <div key={label}>
+                    <label style={{ fontSize: 12, color: '#6b7280', display: 'block', marginBottom: 6 }}>{label}</label>
+                    <input
+                      type="number"
+                      value={value}
+                      placeholder={placeholder}
+                      onChange={e => {
+                        (set as (v: string) => void)(e.target.value);
+                        if (agent) saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, step: 'configuring', [fieldKey]: e.target.value });
+                      }}
+                      style={{ width: '100%', padding: '8px 12px', borderRadius: 6, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', fontSize: 14, outline: 'none' }}
+                    />
+                    <p style={{ fontSize: 11, color: '#4b5563', marginTop: 4 }}>{hint}</p>
+                  </div>
+                ))}
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <label style={{ fontSize: 12, color: '#6b7280', display: 'block', marginBottom: 6 }}>Allowed Coins (comma-separated; blank = any)</label>
+                  <input
+                    type="text"
+                    value={hlAllowedCoins}
+                    placeholder="e.g. HYPE, PURR, BTC"
+                    onChange={e => {
+                      setHlAllowedCoins(e.target.value);
+                      if (agent) saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, step: 'configuring', hlAllowedCoins: e.target.value });
+                    }}
+                    style={{ width: '100%', padding: '8px 12px', borderRadius: 6, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', fontSize: 14, outline: 'none' }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Section: Trading Mode */}
           <p style={{ fontSize: 11, color: '#4b5563', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10 }}>Trading Mode</p>
           <div style={{ display: 'flex', gap: 10, marginBottom: 20 }}>
@@ -734,9 +1010,16 @@ export default function AgentSetup({ wallet }: Props) {
             </p>
           </div>
 
-          <Button onClick={signAndSubmitPolicy} loading={loading}>
-            Review & Sign Policy
-          </Button>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <Button onClick={signAndSubmitPolicy} loading={loading}>
+              {isEditingExistingPolicy ? 'Review & Re-sign Policy' : 'Review & Sign Policy'}
+            </Button>
+            {isEditingExistingPolicy && (
+              <Button variant="ghost" onClick={cancelPolicyEdit} disabled={loading}>
+                Cancel
+              </Button>
+            )}
+          </div>
           {error && <p style={{ color: '#ef4444', fontSize: 13, marginTop: 10 }}>{error}</p>}
         </div>
       )}
@@ -774,7 +1057,7 @@ export default function AgentSetup({ wallet }: Props) {
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
               <span style={{ color: '#6b7280' }}>Policy ID</span>
               <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#a78bfa' }}>
-                {signedPolicyId?.slice(0, 16)}…
+                {activePolicyId?.slice(0, 16)}…
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
@@ -1111,6 +1394,72 @@ export default function AgentSetup({ wallet }: Props) {
             )}
           </div>
 
+          {/* Hyperliquid API Wallet (signer) */}
+          <div style={{ background: '#0f1117', border: '1px solid #2d3748', borderRadius: 8, padding: '14px 16px', marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <span style={{ fontSize: 13, color: '#6b7280' }}>Hyperliquid API Wallet</span>
+              <span style={{
+                fontSize: 11, padding: '2px 8px', borderRadius: 999, fontWeight: 600,
+                background: hlKeyStatus === 'active' ? '#14532d33' : '#7f1d1d22',
+                color: hlKeyStatus === 'active' ? '#4ade80' : '#f87171',
+                border: `1px solid ${hlKeyStatus === 'active' ? '#14532d66' : '#7f1d1d44'}`,
+              }}>{hlKeyStatus === 'active' ? 'Configured' : hlKeyStatus === 'none' ? 'Not set' : '…'}</span>
+            </div>
+            {hlKeyStatus === 'active' ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <p style={{ fontSize: 12, color: '#4b5563', flex: 1 }}>
+                  API wallet stored. It signs spot orders for your connected wallet (the master account that holds funds). It cannot withdraw.
+                </p>
+                <button onClick={removeHlKey} style={{ fontSize: 11, padding: '3px 10px', borderRadius: 6, background: '#7f1d1d44', border: '1px solid #7f1d1d', color: '#f87171', cursor: 'pointer' }}>Remove</button>
+              </div>
+            ) : (
+              <>
+                <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 10, lineHeight: 1.5 }}>
+                  Paste the <strong style={{ color: '#a0aec0' }}>API wallet</strong> address + secret key you generated on Hyperliquid (More → API). It signs orders on behalf of your connected main wallet (the fund holder). Stored encrypted; cannot withdraw.
+                </p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <input type="text" value={hlAddrInput} onChange={e => setHlAddrInput(e.target.value)} placeholder="API wallet address (0x…)"
+                    style={{ padding: '7px 10px', borderRadius: 6, fontSize: 13, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', outline: 'none', fontFamily: 'monospace' }} />
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input type="password" value={hlKeyInput} onChange={e => setHlKeyInput(e.target.value)} placeholder="API wallet secret key (0x…)"
+                      style={{ flex: 1, padding: '7px 10px', borderRadius: 6, fontSize: 13, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', outline: 'none', fontFamily: 'monospace' }} />
+                    <Button size="sm" variant="ghost" onClick={saveHlKey} loading={hlKeySaving} disabled={!hlKeyInput.trim() || !hlAddrInput.trim()}>Save</Button>
+                  </div>
+                </div>
+                {hlKeyError && <p style={{ fontSize: 12, color: '#f87171', marginTop: 6 }}>{hlKeyError}</p>}
+              </>
+            )}
+          </div>
+
+          {/* Hyperliquid Deposit */}
+          {hlKeyStatus === 'active' && (
+            <div style={{ background: '#0f1117', border: '1px solid #2d3748', borderRadius: 8, padding: '14px 16px', marginBottom: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <span style={{ fontSize: 13, color: '#6b7280' }}>Hyperliquid Balance</span>
+                <span style={{ fontSize: 12, color: hlBalance && hlBalance.usdc > 0 ? '#4ade80' : '#6b7280' }}>
+                  {hlBalance ? `$${hlBalance.usdc.toFixed(2)} USDC` : '—'}
+                </span>
+              </div>
+              {hlBalance && hlBalance.balances.length > 0 && (
+                <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 10 }}>
+                  Holdings: {hlBalance.balances.map(b => `${b.total} ${b.coin}`).join(', ')}
+                </p>
+              )}
+              <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, lineHeight: 1.5 }}>
+                Deposit <strong style={{ color: '#a0aec0' }}>native USDC on Arbitrum</strong> (not USDC.e) to Hyperliquid. Min <strong style={{ color: '#a0aec0' }}>5 USDC</strong> — less is lost. Credits your account in &lt;1 min.
+              </p>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <input type="number" value={hlDepositAmount} onChange={e => setHlDepositAmount(e.target.value)} min={5}
+                  style={{ width: 90, padding: '7px 10px', borderRadius: 6, fontSize: 13, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', outline: 'none' }} />
+                <Button size="sm" variant="ghost" onClick={depositToHyperliquid} loading={hlDepositing} disabled={wallet.status !== 'connected'}>
+                  Deposit USDC via MetaMask
+                </Button>
+                <button onClick={refreshHlBalance} style={{ fontSize: 11, color: '#4b5563', background: 'none', border: 'none', cursor: 'pointer' }}>Refresh</button>
+              </div>
+              {hlDepositError && <p style={{ fontSize: 12, color: '#f87171', marginTop: 6 }}>{hlDepositError}</p>}
+            </div>
+          )}
+
           {/* M7: CLOB Credential derivation */}
           <div style={{
             background: '#0f1117', border: '1px solid #2d3748',
@@ -1152,6 +1501,9 @@ export default function AgentSetup({ wallet }: Props) {
             }
             <Button variant={getSessionStatus().state === 'expired' ? 'primary' : 'ghost'} size="sm" onClick={signAndSubmitPolicy} loading={loading}>
               Re-sign Policy
+            </Button>
+            <Button variant="ghost" size="sm" onClick={beginPolicyEdit}>
+              Edit Policy
             </Button>
             <Button variant="danger" size="sm" onClick={revokePolicy} loading={loading}>
               Revoke Policy

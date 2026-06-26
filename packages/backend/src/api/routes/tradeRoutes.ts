@@ -10,11 +10,12 @@ import { selectTradeLimitPrice } from '../../clob/marketPricing';
 import { repairMatchedFillsForAgent } from '../../clob/fillAccounting';
 import { getDb } from '../../db/database';
 import { writeAudit } from '../../db/auditRepository';
-import { isLiveTradingEnabled } from '../middleware';
 import { logger } from '../../utils/logger';
 import { runAgentChat } from '../../agent/agentChat';
 import { ethers } from 'ethers';
 import { getContractConfig } from '@polymarket/clob-client-v2';
+import { HyperliquidClient } from '../../clob/hyperliquidClient';
+import { hasHlCreds } from '../../utils/hyperliquidKeyStore';
 import type { StoredPolicy } from '../../types/policy';
 
 /** On-chain pUSD balance of the agent's deposit wallet (the real wallet balance), or null. */
@@ -111,10 +112,6 @@ router.post('/intent', async (req, res) => {
 
   if (!rawInput && !structuredIntent) {
     return res.status(400).json({ error: 'Either rawInput or structuredIntent is required' });
-  }
-
-  if (!paperMode && isLiveTradingEnabled() === false) {
-    return res.status(403).json({ error: 'Live trading is disabled. Use paperMode: true.' });
   }
 
   // Step 1: Parse intent
@@ -307,7 +304,7 @@ router.post('/intent', async (req, res) => {
     });
   }
 
-  // Live trading path (behind ENABLE_LIVE_TRADING feature flag)
+  // Live trading path. Order size is bounded by the signed policy (maxOrderSizeUSDC).
   // Step 6: Build order
   const clobClient = new ClobTradingClientImpl();
   let liveTickSize: number;
@@ -336,15 +333,6 @@ router.post('/intent', async (req, res) => {
     return res.status(500).json({
       error: 'Order price changed during construction',
       reason: `Live quote ${intent.limitPrice} became ${order.price}; order was not submitted.`,
-    });
-  }
-
-  // Hard global cap: never submit a live order above MAX_GLOBAL_LIVE_ORDER_USDC
-  const maxLive = parseFloat(process.env.MAX_GLOBAL_LIVE_ORDER_USDC ?? '1');
-  const orderValueUsdc = order.amountUsdc ?? order.price * order.size;
-  if (orderValueUsdc > maxLive) {
-    return res.status(403).json({
-      error: `Order value $${orderValueUsdc.toFixed(2)} exceeds the live trading cap ($${maxLive}). Lower the order size.`,
     });
   }
 
@@ -383,7 +371,7 @@ router.post('/intent', async (req, res) => {
     clobOrderId: postResult.clobOrderId,
     price: order.price,
     size: order.size,
-    orderValue: orderValueUsdc,
+    orderValue: order.amountUsdc ?? order.price * order.size,
     status: postResult.clobStatus ?? null,
     riskSummary: decision.riskSummary,
   });
@@ -400,9 +388,10 @@ router.post('/cancel-all', async (req, res) => {
     WHERE agent_wallet_id = ? AND status IN ('open', 'pending', 'partially_filled')
   `).run(Date.now(), policy.agentWalletId);
 
-  // If live trading is active, also cancel on CLOB
+  // If the agent has any live (CLOB) orders, also cancel them on CLOB.
   let clobCancelled = 0;
-  if (isLiveTradingEnabled()) {
+  const hasLiveOrders = db.prepare("SELECT 1 FROM orders WHERE agent_wallet_id = ? AND clob_order_id IS NOT NULL LIMIT 1").get(policy.agentWalletId);
+  if (hasLiveOrders) {
     try {
       const clobClient = new ClobTradingClientImpl();
       await clobClient.cancelAll(policy.agentWalletId);
@@ -433,7 +422,7 @@ router.post('/cancel/:orderId', async (req, res) => {
 
   db.prepare("UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?").run(Date.now(), orderId);
 
-  if (isLiveTradingEnabled() && row.clob_order_id) {
+  if (row.clob_order_id) {
     try {
       const clobClient = new ClobTradingClientImpl();
       await clobClient.cancelOrder(policy.agentWalletId, row.clob_order_id as string);
@@ -460,10 +449,8 @@ router.get('/portfolio', async (req, res) => {
   const agentWalletId = policy.agentWalletId;
 
   // Refresh live fills from the CLOB so positions reflect executed trades (no-op for paper).
-  if (process.env.ENABLE_LIVE_TRADING === 'true') {
-    try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
-    catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
-  }
+  try { await new ClobTradingClientImpl().reconcileLiveFills(agentWalletId); }
+  catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
   repairMatchedFillsForAgent(db, agentWalletId);
 
   const summary = db.prepare(`
@@ -490,7 +477,7 @@ router.get('/portfolio', async (req, res) => {
     JOIN orders o ON o.id = f.order_id
     LEFT JOIN markets m ON m.market_id = o.market_id
     LEFT JOIN market_tokens mt ON mt.token_id = o.token_id
-    WHERE o.agent_wallet_id = ?
+    WHERE o.agent_wallet_id = ? AND o.venue = 'polymarket'
     GROUP BY o.market_id, o.token_id
     HAVING net_shares > 0.0001
     ORDER BY total_buy_cost_usdc DESC
@@ -534,6 +521,17 @@ router.get('/portfolio', async (req, res) => {
 
   const walletBalanceUsdc = await getWalletBalanceUsdc(agentWalletId);
 
+  // Live Hyperliquid spot balances (master account), when an API wallet is configured.
+  let hyperliquid: { usdc: number; balances: { coin: string; total: number }[] } | null = null;
+  if (hasHlCreds(agentWalletId)) {
+    try {
+      const state = await new HyperliquidClient().getSpotState(agentWalletId);
+      hyperliquid = { usdc: state.usdc, balances: state.balances.filter(b => b.coin !== 'USDC') };
+    } catch (err) {
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid balance fetch failed');
+    }
+  }
+
   return res.json({
     agentWalletId,
     summary: {
@@ -547,6 +545,7 @@ router.get('/portfolio', async (req, res) => {
     },
     positions,
     recentOrders,
+    hyperliquid,
   });
 });
 

@@ -36,9 +36,11 @@ interface PortfolioData {
     totalSpentUsdc: number;
     budgetUsdc: number;
     budgetRemainingUsdc: number;
+    walletBalanceUsdc: number | null;
   };
   positions: Position[];
   recentOrders: Order[];
+  hyperliquid: { usdc: number; balances: { coin: string; total: number }[] } | null;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -151,7 +153,7 @@ export default function Portfolio({ hideTitle = false }: { hideTitle?: boolean }
 
   if (!data) return null;
 
-  const { summary, positions, recentOrders } = data;
+  const { summary, positions, recentOrders, hyperliquid } = data;
   const budgetPct = summary.budgetUsdc > 0
     ? Math.min(100, (summary.totalSpentUsdc / summary.budgetUsdc) * 100)
     : 0;
@@ -159,8 +161,11 @@ export default function Portfolio({ hideTitle = false }: { hideTitle?: boolean }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {/* Summary row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
         {[
+          ...(summary.walletBalanceUsdc !== null
+            ? [{ label: 'Wallet Balance', value: `$${fmt(summary.walletBalanceUsdc, 2)}`, sub: 'pUSD on-chain' }]
+            : []),
           { label: 'Total Spent', value: `$${fmt(summary.totalSpentUsdc, 2)}`, sub: `of $${fmt(summary.budgetUsdc, 0)} budget` },
           { label: 'Budget Left', value: `$${fmt(Math.max(0, summary.budgetRemainingUsdc), 2)}`, sub: `${(100 - budgetPct).toFixed(0)}% remaining` },
           { label: 'Filled Orders', value: String(summary.filledOrders), sub: `${summary.totalOrders} total` },
@@ -234,6 +239,28 @@ export default function Portfolio({ hideTitle = false }: { hideTitle?: boolean }
           </table>
         )}
       </Card>
+
+      {/* Hyperliquid spot balances */}
+      {hyperliquid && (
+        <Card>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: '#e2e8f0' }}>Hyperliquid (spot)</h3>
+            <span style={{ fontSize: 13, color: hyperliquid.usdc > 0 ? '#4ade80' : '#6b7280' }}>${hyperliquid.usdc.toFixed(2)} USDC</span>
+          </div>
+          {hyperliquid.balances.length === 0 ? (
+            <p style={{ fontSize: 12, color: '#6b7280' }}>No token holdings yet.</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {hyperliquid.balances.map((b, i) => (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
+                  <span style={{ color: '#e2e8f0' }}>{b.coin}</span>
+                  <span style={{ color: '#a0aec0' }}>{b.total}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
 
       {/* Recent orders */}
       <Card>

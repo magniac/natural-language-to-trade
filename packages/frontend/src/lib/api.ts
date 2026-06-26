@@ -53,7 +53,7 @@ export const api = {
     }),
 
   getAgent: (agentId: string) =>
-    request<{ id: string; address: string; status: string }>(`/agents/${agentId}`),
+    request<{ id: string; address: string; status: string; proxy_wallet_address?: string | null }>(`/agents/${agentId}`),
 
   pauseAgent: (agentId: string) =>
     request<{ status: string }>(`/agents/${agentId}/pause`, { method: 'POST' }),

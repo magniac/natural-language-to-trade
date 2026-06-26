@@ -22,6 +22,14 @@ export interface TradingPolicy {
   maxExpirationSeconds: number | null;
 }
 
+export type Venue = 'polymarket' | 'hyperliquid';
+
+export interface HyperliquidPolicy {
+  maxOrderSizeUSDC: number;
+  allowedCoins: string[];   // empty = any spot coin
+  maxSlippageBps: number;
+}
+
 export interface AgentPolicy {
   version: '1';
   userWallet: string;
@@ -32,6 +40,10 @@ export interface AgentPolicy {
   revocationNonce: string;
   llm: LLMPolicy;
   trading: TradingPolicy;
+  // Optional so policies signed before multi-venue support remain valid. When absent,
+  // only Polymarket is allowed (Hyperliquid requires a re-signed policy that opts in).
+  allowedVenues?: Venue[];
+  hyperliquid?: HyperliquidPolicy;
 }
 
 export type PolicyStatus = 'active' | 'expired' | 'revoked' | 'superseded';

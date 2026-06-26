@@ -29,7 +29,7 @@ async function main() {
 
   const app = createApp();
   app.listen(PORT, () => {
-    logger.info({ port: PORT, liveTradingEnabled: process.env.ENABLE_LIVE_TRADING === 'true' }, 'Backend server started');
+    logger.info({ port: PORT }, 'Backend server started');
   });
 }
 

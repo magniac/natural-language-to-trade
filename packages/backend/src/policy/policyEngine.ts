@@ -84,6 +84,10 @@ export function runPolicyEngine(input: PolicyEngineInput): PolicyDecision {
   const nowSec = Math.floor(Date.now() / 1000);
   if (policy.expiresAt <= nowSec) reasons.push('Policy expiry timestamp has passed');
 
+  // ── Venue gate (default to Polymarket-only for policies signed before multi-venue) ──
+  if (!(policy.allowedVenues ?? ['polymarket']).includes('polymarket'))
+    reasons.push('Polymarket trading is not allowed by this policy');
+
   // ── Market identity checks ──
   if (!resolvedMarket.marketId) reasons.push('No market ID resolved');
   if (!resolvedMarket.yesTokenId || !resolvedMarket.noTokenId)
@@ -191,6 +195,62 @@ export function runPolicyEngine(input: PolicyEngineInput): PolicyDecision {
     normalizedIntent: allowed ? intent : null,
     riskSummary: allowed ? riskSummary : null,
   };
+}
+
+// ─── Hyperliquid spot policy (deterministic; shares global budget/daily caps) ──
+
+export interface HyperliquidPolicyInput {
+  policy: AgentPolicy;
+  coin: string;
+  side: 'BUY' | 'SELL';
+  orderValueUsdc: number;
+  accountState: AccountState;   // budget/daily/openOrders are shared across venues
+  usageState: UsageState;
+}
+
+export function runHyperliquidPolicy(input: HyperliquidPolicyInput): { allowed: boolean; reasons: string[] } {
+  const { policy, coin, side, orderValueUsdc, accountState, usageState } = input;
+  const reasons: string[] = [];
+  const trading = policy.trading;
+  const hl = policy.hyperliquid;
+
+  // ── Policy-level ──
+  if (!usageState.policyActive) reasons.push('Policy is not active');
+  if (usageState.policyExpired) reasons.push('Policy has expired');
+  if (usageState.sessionKeyRevoked) reasons.push('Session key has been revoked');
+  if (policy.expiresAt <= Math.floor(Date.now() / 1000)) reasons.push('Policy expiry timestamp has passed');
+
+  // ── Venue gate ──
+  if (!(policy.allowedVenues ?? ['polymarket']).includes('hyperliquid'))
+    reasons.push('Hyperliquid trading is not allowed by this policy');
+  if (!hl) reasons.push('No Hyperliquid limits configured — re-sign the policy to enable Hyperliquid');
+
+  // ── Side + coin allow-lists ──
+  if (!trading.allowedSides.includes(side))
+    reasons.push(`Side "${side}" is not in the allowed sides list`);
+  if (hl && hl.allowedCoins.length > 0 && !hl.allowedCoins.map(c => c.toUpperCase()).includes(coin.toUpperCase()))
+    reasons.push(`Coin ${coin} is not in the allowed Hyperliquid coins list`);
+
+  // ── Order size (HL-specific + shared global cap) ──
+  if (orderValueUsdc <= 0) reasons.push('Order value could not be determined');
+  if (hl && orderValueUsdc > hl.maxOrderSizeUSDC)
+    reasons.push(`Order size $${orderValueUsdc.toFixed(2)} exceeds Hyperliquid max order size $${hl.maxOrderSizeUSDC}`);
+  if (orderValueUsdc > trading.maxOrderSizeUSDC)
+    reasons.push(`Order size $${orderValueUsdc.toFixed(2)} exceeds max order size $${trading.maxOrderSizeUSDC}`);
+
+  // ── Budget / daily (BUY only; shared across venues) ──
+  if (side === 'BUY') {
+    if (orderValueUsdc > accountState.budgetRemainingUSDC)
+      reasons.push(`Order $${orderValueUsdc.toFixed(2)} exceeds remaining budget $${accountState.budgetRemainingUSDC.toFixed(2)}`);
+    if (accountState.dailySpendUSDC + orderValueUsdc > trading.maxDailySpendUSDC)
+      reasons.push(`Daily spend limit exceeded: $${accountState.dailySpendUSDC.toFixed(2)} + $${orderValueUsdc.toFixed(2)} > $${trading.maxDailySpendUSDC}`);
+  }
+
+  // ── Open orders (shared) ──
+  if (accountState.openOrderCount >= trading.maxOpenOrders)
+    reasons.push(`Too many open orders: ${accountState.openOrderCount} >= max ${trading.maxOpenOrders}`);
+
+  return { allowed: reasons.length === 0, reasons };
 }
 
 export function checkLLMPolicy(

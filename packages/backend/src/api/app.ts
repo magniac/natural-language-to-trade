@@ -21,7 +21,7 @@ export function createApp() {
 
   // Health check — available at both /health and /api/health
   const healthHandler = (_req: express.Request, res: express.Response) =>
-    res.json({ status: 'ok', liveTradingEnabled: process.env.ENABLE_LIVE_TRADING === 'true' });
+    res.json({ status: 'ok', liveTradingEnabled: true });
   app.get('/health', healthHandler);
   app.get('/api/health', healthHandler);
 

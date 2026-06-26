@@ -32,10 +32,25 @@ export interface PersistedAgentWallet {
   // Allowed sides
   allowBuy?: boolean;
   allowSell?: boolean;
+  // Hyperliquid venue (spot)
+  allowHyperliquid?: boolean;
+  hlAllowedCoins?: string;   // comma-separated; '' = any
+  hlMaxOrder?: string;
+  hlSlippageBps?: string;
 }
 
 export function saveAgentWallet(info: PersistedAgentWallet): void {
-  localStorage.setItem(AGENT_WALLET_KEY, JSON.stringify(info));
+  // Merge with any existing record for the same agent so fields not included in this call
+  // (e.g. Hyperliquid policy fields set elsewhere) are preserved. A different agent resets.
+  let merged: PersistedAgentWallet = info;
+  try {
+    const raw = localStorage.getItem(AGENT_WALLET_KEY);
+    if (raw) {
+      const prev = JSON.parse(raw) as PersistedAgentWallet;
+      if (prev.agentWalletId === info.agentWalletId) merged = { ...prev, ...info };
+    }
+  } catch { /* ignore */ }
+  localStorage.setItem(AGENT_WALLET_KEY, JSON.stringify(merged));
 }
 
 export function loadAgentWallet(): PersistedAgentWallet | null {
@@ -75,6 +90,27 @@ export function loadSession(): AgentSession | null {
     return session;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Peek at session state without deleting it, so the UI can tell apart
+ * "never set up" from "policy/session expired" (which needs a re-sign).
+ */
+export function getSessionStatus(): { state: 'valid' | 'expired' | 'none'; expiresAt?: number } {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) {
+      // Setup may have completed earlier even if the session was cleared on expiry.
+      return loadAgentWallet()?.step === 'done' ? { state: 'expired' } : { state: 'none' };
+    }
+    const session = JSON.parse(raw) as AgentSession;
+    if (session.expiresAt < Math.floor(Date.now() / 1000)) {
+      return { state: 'expired', expiresAt: session.expiresAt };
+    }
+    return { state: 'valid', expiresAt: session.expiresAt };
+  } catch {
+    return { state: 'none' };
   }
 }
 

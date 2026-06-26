@@ -265,16 +265,7 @@ export class ClobTradingClientImpl implements ClobTradingClientInterface {
   }
 
   async createSignedOrder(agentWalletId: string, order: NormalizedOrder): Promise<unknown> {
-    if (process.env.ENABLE_LIVE_TRADING !== 'true') {
-      throw new Error('Live trading is disabled. Set ENABLE_LIVE_TRADING=true to enable.');
-    }
-
-    const maxGlobal = parseFloat(process.env.MAX_GLOBAL_LIVE_ORDER_USDC ?? '1');
-    const orderValue = order.size * order.price;
-    if (orderValue > maxGlobal) {
-      throw new Error(`Order value $${orderValue} exceeds global live trading limit $${maxGlobal}`);
-    }
-
+    // Order size is bounded by the signed policy (maxOrderSizeUSDC), enforced in the policy engine.
     const client = await buildClobClient(agentWalletId);
     const side: Side = order.side === 'BUY' ? Side.BUY : Side.SELL;
 
@@ -320,10 +311,6 @@ export class ClobTradingClientImpl implements ClobTradingClientInterface {
   }
 
   async postOrder(agentWalletId: string, signedOrder: unknown, orderType: string): Promise<PostOrderResult> {
-    if (process.env.ENABLE_LIVE_TRADING !== 'true') {
-      throw new Error('Live trading is disabled');
-    }
-
     const client = await buildClobClient(agentWalletId);
     try {
       const result = await client.postOrder(signedOrder as never, orderType as never);
@@ -348,8 +335,8 @@ export class ClobTradingClientImpl implements ClobTradingClientInterface {
    * one synthetic fill row per CLOB order, keyed by clob_order_id, updated as more size matches.
    */
   async reconcileLiveFills(agentWalletId: string): Promise<void> {
-    if (process.env.ENABLE_LIVE_TRADING !== 'true') return;
     const db = getDb();
+    // Only live orders carry a clob_order_id; paper orders are excluded, so this is a no-op for them.
     const openOrders = db.prepare(
       "SELECT id, clob_order_id, side, price, size FROM orders WHERE agent_wallet_id = ? AND clob_order_id IS NOT NULL AND status IN ('open','pending','partially_filled')"
     ).all(agentWalletId) as Array<{ id: string; clob_order_id: string; side: string; price: number; size: number }>;
