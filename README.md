@@ -1,6 +1,6 @@
 # Orbit Natural-Language Trading Demo
 
-A local full-stack demo for turning natural-language instructions into policy-constrained Polymarket orders. It combines a React interface, an Express API, a deterministic policy engine, paper trading, and an optional live-trading path through Polymarket's CLOB and relayer.
+A local full-stack demo for turning natural-language instructions into policy-constrained Polymarket and Hyperliquid trades. It combines a React interface, an Express API, a deterministic policy engine, paper trading, and optional live-trading paths through Polymarket's CLOB/relayer and Hyperliquid spot.
 
 > **Development demo only.** The current signer stores agent private keys encrypted in a local SQLite database. The production KMS signer is not implemented. Do not deploy this application or use meaningful funds without replacing the development signer and completing a security review.
 
@@ -9,11 +9,11 @@ A local full-stack demo for turning natural-language instructions into policy-co
 - Searches and refreshes active Polymarket markets.
 - Parses natural-language trade requests with an OpenRouter model.
 - Verifies a user-signed EIP-712 policy before accepting agent requests.
-- Enforces budget, order-size, daily-spend, liquidity, spread, price, expiry, and request limits deterministically.
+- Enforces venue, budget, order-size, daily-spend, liquidity, spread, price, expiry, coin, slippage, and request limits deterministically.
 - Simulates orders in paper mode, which is the default.
-- Optionally signs and posts live CLOB orders behind server and per-agent feature flags.
+- Optionally signs and posts live Polymarket CLOB orders and Hyperliquid spot orders behind policy and per-agent mode controls.
 - Displays holdings, recent orders, and budget use.
-- Supports pausing, policy revocation, cancelling orders, and relayed pUSD withdrawals.
+- Supports pausing, policy editing/re-signing, policy revocation, cancelling orders, and relayed pUSD withdrawals.
 
 ## Requirements
 
@@ -28,6 +28,12 @@ Live trading additionally requires:
 - A Polymarket relayer API key for that agent wallet
 - pUSD on Polygon in the connected funding wallet
 - A small amount of POL in the funding wallet for the initial pUSD transfer
+
+Hyperliquid live trading additionally requires:
+
+- A Hyperliquid account funded from the connected main wallet
+- A Hyperliquid API wallet address and secret key created in Hyperliquid
+- Native USDC on Arbitrum for deposits to Hyperliquid
 
 Make sure your location and intended use comply with Polymarket's terms and applicable law. The backend geoblock is enabled by default.
 
@@ -51,10 +57,9 @@ Generate a local encryption key and paste it into `packages/backend/.env` as `EN
 openssl rand -hex 32
 ```
 
-For natural-language parsing, set `OPENROUTER_API_KEY` in the environment file or add a key later in Agent Setup. Keep live trading disabled while getting started:
+For natural-language parsing, set `OPENROUTER_API_KEY` in the environment file or add a key later in Agent Setup. Keep the default development signer while getting started:
 
 ```dotenv
-ENABLE_LIVE_TRADING=false
 SIGNER_MODE=dev
 ```
 
@@ -77,22 +82,21 @@ Open [http://localhost:3000](http://localhost:3000). The frontend proxies `/api`
 1. Connect the wallet that will own and sign the agent policy.
 2. Create an agent in Agent Setup.
 3. Add an OpenRouter API key if one is not configured on the backend.
-4. Choose policy limits and sign the EIP-712 policy.
+4. Choose policy limits, enabled venues, and sign the EIP-712 policy.
 5. Leave the agent in Paper mode.
 6. Open Chat and ask the agent to search markets, inspect the portfolio, or place a paper trade.
 
 Paper mode uses simulated fills and does not move funds.
 
-### Live trading
+### Editing a policy
 
-Live mode is deliberately opt-in. First set these backend values and restart the server:
+Policies can be changed without revoking the agent. In Agent Setup, click **Edit Policy**, adjust the limits or Hyperliquid venue settings, then review and re-sign. The current policy stays active until the new signed policy is accepted by the backend. Once accepted, the new policy becomes active and the previous active policy is marked superseded.
 
-```dotenv
-ENABLE_LIVE_TRADING=true
-MAX_GLOBAL_LIVE_ORDER_USDC=1
-```
+Use **Re-sign Policy** when you only want to refresh the session key or extend the policy duration without changing the visible limits. Use **Revoke Policy** when you want to disable the agent and clear the local session.
 
-Then complete Agent Setup in order:
+### Polymarket live trading
+
+Live mode is deliberately opt-in per agent. Complete Agent Setup in order:
 
 1. Connect the main wallet that will sign the policy and fund the deposit wallet.
 2. Create an agent, then import the private key of a separate wallet already onboarded with Polymarket.
@@ -104,7 +108,20 @@ Then complete Agent Setup in order:
 8. Authorize trading; the relayer batches the required pUSD and outcome-token approvals.
 9. Derive CLOB credentials and switch the agent to Live mode.
 
-The server-wide `MAX_GLOBAL_LIVE_ORDER_USDC` remains a hard ceiling in addition to the signed policy's limits.
+The signed policy's Polymarket order-size and budget limits remain hard ceilings for live CLOB orders.
+
+### Hyperliquid live trading
+
+Hyperliquid spot trades use the same chat interface and the same signed policy model. To enable them:
+
+1. In the policy editor, enable **Hyperliquid** under Trading Venues.
+2. Set a Hyperliquid max order size, max slippage, and optional comma-separated allowed coins.
+3. Re-sign the policy so Hyperliquid is included in `allowedVenues`.
+4. Add the Hyperliquid API wallet address and secret key in Agent Setup. The app verifies that the secret key derives to the supplied API wallet address before storing it.
+5. Deposit native USDC on Arbitrum to Hyperliquid from the connected main wallet.
+6. Switch the agent to Live mode when ready.
+
+The Hyperliquid API wallet signs orders on behalf of the connected master account. It is not the funding wallet and cannot withdraw funds.
 
 ## Wallets and gas
 
@@ -115,8 +132,9 @@ The demo uses three wallet roles:
 | Main browser wallet | Signs the policy and sends the initial pUSD funding transfer | **Yes, a small amount**, because the pUSD transfer is an ordinary Polygon transaction |
 | Agent EOA | Signs CLOB and relayer requests; its development key is held by the backend | No |
 | Polymarket deposit wallet | Holds pUSD and positions and acts as the CLOB funder/maker | No |
+| Hyperliquid API wallet | Signs Hyperliquid spot orders for the connected master account | No |
 
-Policy signing is off-chain. Deposit-wallet provisioning, exchange approvals, and withdrawals are submitted through Polymarket's relayer, which pays gas. CLOB orders are signed and posted to the API. The only direct on-chain transaction initiated by the frontend is the initial pUSD transfer from the connected main wallet, so that wallet must have enough POL for its gas fee.
+Policy signing is off-chain. Deposit-wallet provisioning, exchange approvals, and withdrawals are submitted through Polymarket's relayer, which pays gas. CLOB orders and Hyperliquid spot orders are signed and posted to their APIs. The direct on-chain transactions initiated by the frontend are the initial pUSD transfer on Polygon and optional native USDC deposits to Hyperliquid on Arbitrum, so the connected wallet needs gas on the relevant chain.
 
 ## Configuration
 
@@ -130,8 +148,6 @@ The complete starting configuration is in [`packages/backend/.env.example`](pack
 | `OPENROUTER_API_KEY` | none | Optional global LLM key; Agent Setup can store one per agent |
 | `OPENROUTER_MODEL` | application default | Overrides the OpenRouter model |
 | `SIGNER_MODE` | `dev` | Local development signer; `kms` is currently a stub |
-| `ENABLE_LIVE_TRADING` | `false` | Server-wide live-trading gate |
-| `MAX_GLOBAL_LIVE_ORDER_USDC` | `1` | Hard maximum value of any live order |
 | `POLYGON_RPC_URL` | public Polygon RPC | RPC used for balances and relayed wallet operations |
 | `RELAYER_API_KEY` / `RELAYER_API_KEY_ADDRESS` | none | Optional server-wide relayer credentials; per-agent credentials can be stored in the UI |
 | `POLY_BUILDER_*` | none | Alternative builder authorization for the relayer |
@@ -140,18 +156,18 @@ The complete starting configuration is in [`packages/backend/.env.example`](pack
 | `BLOCKED_COUNTRY_CODES` | `US,GB` | Comma-separated blocked country codes |
 | `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins |
 
-Never commit a populated `.env` file, wallet private key, relayer credential, CLOB credential, or OpenRouter key.
+Never commit a populated `.env` file, wallet private key, relayer credential, CLOB credential, Hyperliquid API wallet key, or OpenRouter key.
 
 ## How requests are authorized
 
-The main wallet signs an EIP-712 policy containing the owner, agent, session key, expiry, revocation nonce, and trading/LLM limits. The browser stores the generated session key locally and signs each protected API request with a nonce and timestamp. The backend then:
+The main wallet signs an EIP-712 policy containing the owner, agent, session key, expiry, revocation nonce, enabled venues, and trading/LLM limits. The browser stores the generated session key locally and signs each protected API request with a nonce and timestamp. The backend then:
 
 1. Verifies the request signature and rejects replayed nonces.
 2. Loads and re-verifies the stored owner-signed policy.
 3. Parses the requested trade into structured intent.
 4. Resolves current market data.
 5. Runs the deterministic policy engine.
-6. Simulates the trade or, when both live gates are enabled, signs and submits a CLOB order.
+6. Simulates the trade or, when live mode and the signed policy allow it, signs and submits a Polymarket CLOB order or Hyperliquid spot order.
 
 The language model does not decide whether a trade is allowed; it proposes an intent that must pass the policy engine.
 
@@ -163,7 +179,7 @@ packages/
     src/agent/       Chat tools and signer abstraction
     src/api/         Express routes and request middleware
     src/auth/        Policy and session verification
-    src/clob/        Polymarket CLOB and relayer integration
+    src/clob/        Polymarket CLOB, relayer, and Hyperliquid integration
     src/market/      Gamma ingestion and market resolution
     src/policy/      Deterministic policy engine
     src/simulator/   Paper-trading execution
@@ -186,9 +202,10 @@ npm run build         # Build backend and frontend
 
 ## Safety notes and current limitations
 
-- Live trading is disabled by default and requires both the server flag and Live mode on the agent.
+- Live trading requires Live mode on the agent and must pass the signed policy limits.
 - `SIGNER_MODE=dev` is intentionally rejected when `NODE_ENV=production`.
 - The development signer can import and decrypt agent private keys. It is unsuitable for a hosted service.
+- Hyperliquid API wallet keys are stored encrypted in the local SQLite database for this demo.
 - `SIGNER_MODE=kms` is not implemented yet.
 - SQLite is intended for a local demo, not distributed deployment.
-- Review the policy defaults, geoblocking, custody model, relayer permissions, and Polymarket integration before testing with live funds.
+- Review the policy defaults, geoblocking, custody model, relayer permissions, Hyperliquid API wallet permissions, and exchange integrations before testing with live funds.
