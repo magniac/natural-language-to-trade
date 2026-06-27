@@ -1,8 +1,36 @@
-import axios from 'axios';
+import axios, { AxiosError, type AxiosRequestConfig } from 'axios';
 import type { Market, MarketToken } from '../types/market';
 import { logger } from '../utils/logger';
 
 const GAMMA_HOST = process.env.POLYMARKET_GAMMA_HOST ?? 'https://gamma-api.polymarket.com';
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+/**
+ * GET against Gamma with retry + backoff. Polymarket rate-limits heavy crawling (HTTP 429);
+ * retrying the same request (respecting Retry-After) rather than aborting lets the full-catalogue
+ * crawl complete instead of stopping at the first throttle. Also retries transient 5xx/network errors.
+ */
+async function gammaGet<T>(url: string, config: AxiosRequestConfig, retries = 5): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return (await axios.get<T>(url, config)).data;
+    } catch (err) {
+      lastErr = err;
+      const status = (err as AxiosError).response?.status;
+      const retryable = status === undefined || status === 429 || status === 408 || (status >= 500 && status < 600);
+      if (attempt === retries || !retryable) throw err;
+      const retryAfterHeader = parseInt(String((err as AxiosError).response?.headers?.['retry-after'] ?? ''), 10);
+      const delayMs = Number.isFinite(retryAfterHeader)
+        ? retryAfterHeader * 1000
+        : Math.min(20_000, 750 * 2 ** attempt) + Math.floor(Math.random() * 400);
+      logger.warn({ url, status, attempt: attempt + 1, delayMs }, 'Gamma request rate-limited/failed — backing off');
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr;
+}
 
 interface GammaMarketFlat {
   id: string;
@@ -73,11 +101,11 @@ function flatToMarket(gm: GammaMarketFlat): Market | null {
 
 /** Fetch a single market by its Gamma market ID. Returns null if not found. */
 export async function fetchGammaMarketById(marketId: string): Promise<Market | null> {
-  const resp = await axios.get<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, {
+  const data = await gammaGet<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, {
     params: { id: marketId },
     timeout: 10_000,
   });
-  const markets = (resp.data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
+  const markets = (data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
   return markets[0] ?? null;
 }
 
@@ -91,8 +119,8 @@ export async function fetchGammaMarkets(params: {
   const qp: Record<string, string | number | boolean> = { limit, offset };
   if (active === true) { qp.active = true; qp.closed = false; qp.archived = false; }
 
-  const resp = await axios.get<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, { params: qp, timeout: 15_000 });
-  const markets = (resp.data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
+  const data = await gammaGet<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, { params: qp, timeout: 15_000 });
+  const markets = (data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
   logger.debug({ count: markets.length, offset }, 'Fetched markets from Gamma (offset)');
   return markets;
 }
@@ -110,8 +138,8 @@ export async function fetchTopMarketsByVolume(limit = 500): Promise<Market[]> {
     order: 'volume24hr',
     ascending: false,
   };
-  const resp = await axios.get<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, { params: qp, timeout: 30_000 });
-  const markets = (resp.data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
+  const data = await gammaGet<GammaMarketFlat[]>(`${GAMMA_HOST}/markets`, { params: qp, timeout: 30_000 });
+  const markets = (data as GammaMarketFlat[]).map(flatToMarket).filter((m): m is Market => m !== null);
   logger.debug({ count: markets.length }, 'Fetched top markets by 24h volume');
   return markets;
 }
@@ -127,12 +155,11 @@ export async function fetchGammaMarketsKeyset(params: {
   if (cursor) qp.next_cursor = cursor;
   if (active === true) { qp.active = true; qp.closed = false; qp.archived = false; }
 
-  const resp = await axios.get<{ markets: GammaMarketFlat[]; next_cursor?: string }>(
+  const raw = await gammaGet<{ markets: GammaMarketFlat[]; next_cursor?: string }>(
     `${GAMMA_HOST}/markets/keyset`,
     { params: qp, timeout: 15_000 }
   );
 
-  const raw = resp.data;
   const markets = (raw.markets ?? []).map(flatToMarket).filter((m): m is Market => m !== null);
   const nextCursor = raw.next_cursor ?? null;
   logger.debug({ count: markets.length, cursor: cursor?.slice(0, 20) }, 'Fetched markets from Gamma (keyset)');
@@ -162,12 +189,11 @@ export async function fetchGammaEventsKeyset(params: {
   if (cursor) qp.next_cursor = cursor;
   if (active === true) { qp.active = true; qp.closed = false; qp.archived = false; }
 
-  const resp = await axios.get<{ events: GammaEvent[]; next_cursor?: string }>(
+  const raw = await gammaGet<{ events: GammaEvent[]; next_cursor?: string }>(
     `${GAMMA_HOST}/events/keyset`,
     { params: qp, timeout: 15_000 }
   );
 
-  const raw = resp.data;
   const markets: Market[] = [];
 
   for (const event of raw.events ?? []) {

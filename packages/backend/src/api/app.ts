@@ -7,6 +7,8 @@ import agentRoutes from './routes/agentRoutes';
 import tradeRoutes from './routes/tradeRoutes';
 import adminRoutes from './routes/adminRoutes';
 import { requireValidSession } from './middleware';
+import { getActiveMarketCount } from '../market/marketRepository';
+import { getMarketIngestionStatus } from '../market/marketIngestionService';
 import { logger } from '../utils/logger';
 
 export function createApp() {
@@ -20,8 +22,16 @@ export function createApp() {
   app.use(rateLimit({ windowMs: 60_000, max: 300, standardHeaders: true, legacyHeaders: false }));
 
   // Health check — available at both /health and /api/health
-  const healthHandler = (_req: express.Request, res: express.Response) =>
-    res.json({ status: 'ok', liveTradingEnabled: true });
+  const healthHandler = (_req: express.Request, res: express.Response) => {
+    let marketCount = 0;
+    try { marketCount = getActiveMarketCount(); } catch { /* DB not ready */ }
+    res.json({
+      status: 'ok',
+      liveTradingEnabled: true,
+      marketCount,
+      marketIngestion: getMarketIngestionStatus(),
+    });
+  };
   app.get('/health', healthHandler);
   app.get('/api/health', healthHandler);
 

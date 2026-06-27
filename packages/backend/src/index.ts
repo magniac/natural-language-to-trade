@@ -6,7 +6,10 @@ import { ingestAllMarkets } from './market/marketIngestionService';
 import { logger } from './utils/logger';
 
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
-const MARKET_REFRESH_INTERVAL_MS = 4 * 60 * 1000; // 4 minutes — keeps data within policy engine's 5-min staleness window
+// Polymarket's full catalogue is ~60k markets; a complete crawl takes a few minutes. Refresh the
+// whole catalogue every 30 min (overlap-guarded). Trade-time freshness is handled separately by the
+// on-demand re-fetch of the specific market in toolPlaceTrade, so the bulk crawl can be infrequent.
+const MARKET_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
 async function main() {
   // Initialize DB and dev signer table
@@ -20,7 +23,7 @@ async function main() {
     logger.error({ err }, 'Initial market ingestion failed')
   );
 
-  // Periodic refresh so market prices stay within the 5-minute staleness window
+  // Periodic full-catalog refresh. Trade-time freshness is handled by on-demand market refetch.
   setInterval(() => {
     ingestAllMarkets(100).catch(err =>
       logger.error({ err }, 'Periodic market refresh failed')

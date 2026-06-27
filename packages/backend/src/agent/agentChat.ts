@@ -115,7 +115,7 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'search_markets',
-      description: 'Search for prediction markets by topic or keyword. Returns matching markets with current YES/NO prices.',
+      description: 'Search for prediction markets by topic or keyword. Returns up to 30 matching markets with current YES/NO prices.',
       parameters: {
         type: 'object',
         properties: {
@@ -174,6 +174,8 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     },
   },
 ];
+
+const MARKET_SEARCH_RESULT_LIMIT = 30;
 
 function buildSystemPrompt(policy: StoredPolicy, accountState: AccountState, liveMode: boolean): string {
   const t = policy.policyJson.trading;
@@ -236,7 +238,13 @@ async function toolSearchMarkets(args: { query: string }) {
 
   if (keywords.length === 0) {
     // No useful keywords — return top active markets
-    const top = db.prepare(`SELECT market_id, title, description, liquidity_usdc, category FROM markets WHERE status='active' ORDER BY liquidity_usdc DESC LIMIT 8`).all() as Array<{ market_id: string; title: string; description: string; liquidity_usdc: number; category: string }>;
+    const top = db.prepare(`
+      SELECT market_id, title, description, liquidity_usdc, category
+      FROM markets
+      WHERE status = 'active'
+      ORDER BY liquidity_usdc DESC
+      LIMIT ?
+    `).all(MARKET_SEARCH_RESULT_LIMIT) as Array<{ market_id: string; title: string; description: string; liquidity_usdc: number; category: string }>;
     return { found: top.length, markets: top.map(r => ({ id: r.market_id, title: r.title, description: r.description?.slice(0, 120) ?? '', liquidity: Math.round(r.liquidity_usdc), category: r.category })) };
   }
 
@@ -253,8 +261,8 @@ async function toolSearchMarkets(args: { query: string }) {
     FROM markets
     WHERE status = 'active' AND (${filterParts})
     ORDER BY kw_score DESC, liquidity_usdc DESC
-    LIMIT 10
-  `).all(...scoreParams, ...filterParams)) as Array<{ market_id: string; title: string; description: string; liquidity_usdc: number; category: string; kw_score: number }>;
+    LIMIT ?
+  `).all(...scoreParams, ...filterParams, MARKET_SEARCH_RESULT_LIMIT)) as Array<{ market_id: string; title: string; description: string; liquidity_usdc: number; category: string; kw_score: number }>;
 
   if (rows.length === 0) {
     return { found: 0, markets: [], note: `No active markets found matching "${rawQuery}". The market may not exist yet.` };

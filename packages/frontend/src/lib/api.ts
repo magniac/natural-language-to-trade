@@ -37,8 +37,42 @@ export interface Market {
   tokens: { tokenId: string; outcome: string; tickSize: number }[];
 }
 
+export interface MarketIngestionStatus {
+  inProgress: boolean;
+  currentRunStartedAt: number | null;
+  lastStartedAt: number | null;
+  lastCompletedAt: number | null;
+  lastSkippedAt: number | null;
+  lastFailedAt: number | null;
+  lastError: string | null;
+  lastResult: {
+    fetched: number;
+    upserted: number;
+    errors: number;
+    durationMs: number;
+    status: 'success' | 'partial' | 'stalled' | 'failed' | 'skipped';
+    message: string;
+    crawls?: Array<{
+      label: string;
+      fetched: number;
+      upserted: number;
+      errors: number;
+      pages: number;
+      status: 'success' | 'stalled' | 'capped' | 'failed';
+      message: string;
+    }>;
+  } | null;
+}
+
+export interface HealthResponse {
+  status: string;
+  liveTradingEnabled: boolean;
+  marketCount?: number;
+  marketIngestion?: MarketIngestionStatus;
+}
+
 export const api = {
-  health: () => request<{ status: string; liveTradingEnabled: boolean }>('/health'),
+  health: () => request<HealthResponse>('/health'),
 
   searchMarkets: (query: string) =>
     request<MarketSearchResult>(`/market/search?q=${encodeURIComponent(query)}`),
