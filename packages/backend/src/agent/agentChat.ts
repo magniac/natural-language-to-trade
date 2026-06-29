@@ -175,7 +175,9 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   },
 ];
 
-const MARKET_SEARCH_RESULT_LIMIT = 30;
+// How many markets search_markets returns to the model. Generous on purpose — the model sifts
+// them for the best semantic match, and ~50 rows (title + short description) is well within context.
+const MARKET_SEARCH_RESULT_LIMIT = 50;
 
 function buildSystemPrompt(policy: StoredPolicy, accountState: AccountState, liveMode: boolean): string {
   const t = policy.policyJson.trading;
@@ -732,7 +734,22 @@ async function toolPlaceHyperliquidTrade(
     intentNonceUsed: false,
   };
 
-  const orderValueUsdc = args.maxSpendUSDC ?? 0; // fractional sells size from balance; budget check is BUY-only
+  const hlClient = new HyperliquidClient();
+  let orderValueUsdc = args.maxSpendUSDC ?? 0;
+  if (args.side === 'SELL') {
+    try {
+      const preview = await hlClient.previewSpotOrder(agentWalletId, {
+        coin,
+        side: args.side,
+        usdcAmount: args.maxSpendUSDC,
+        fraction: args.maxFraction,
+      });
+      orderValueUsdc = preview.notionalUsdc;
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : 'Could not size Hyperliquid sell order', venue: 'hyperliquid' };
+    }
+  }
+
   const decision = runHyperliquidPolicy({ policy: policy.policyJson, coin, side: args.side, orderValueUsdc, accountState, usageState });
   if (!decision.allowed) {
     logger.info({ agentWalletId, reasons: decision.reasons }, 'place_trade (hyperliquid): policy denied');
@@ -747,7 +764,7 @@ async function toolPlaceHyperliquidTrade(
 
   let result;
   try {
-    result = await new HyperliquidClient().placeSpotOrder(agentWalletId, {
+    result = await hlClient.placeSpotOrder(agentWalletId, {
       coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction,
     });
   } catch (err) {

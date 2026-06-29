@@ -152,7 +152,7 @@ export async function fetchGammaMarketsKeyset(params: {
 } = {}): Promise<{ markets: Market[]; nextCursor: string | null }> {
   const { limit = 100, cursor, active } = params;
   const qp: Record<string, string | number | boolean> = { limit };
-  if (cursor) qp.next_cursor = cursor;
+  if (cursor) qp.after_cursor = cursor;
   if (active === true) { qp.active = true; qp.closed = false; qp.archived = false; }
 
   const raw = await gammaGet<{ markets: GammaMarketFlat[]; next_cursor?: string }>(
@@ -186,7 +186,7 @@ export async function fetchGammaEventsKeyset(params: {
 } = {}): Promise<{ markets: Market[]; nextCursor: string | null }> {
   const { limit = 100, cursor, active } = params;
   const qp: Record<string, string | number | boolean> = { limit };
-  if (cursor) qp.next_cursor = cursor;
+  if (cursor) qp.after_cursor = cursor;
   if (active === true) { qp.active = true; qp.closed = false; qp.archived = false; }
 
   const raw = await gammaGet<{ events: GammaEvent[]; next_cursor?: string }>(

@@ -23,6 +23,17 @@ export interface HlOrderResult {
   error: string | null;
 }
 
+export interface HlSpotOrderPreview {
+  coin: string;
+  pair: string;
+  side: 'BUY' | 'SELL';
+  topPrice: number;
+  limitPrice: number;
+  size: number;
+  notionalUsdc: number;
+  availableBase: number | null;
+}
+
 interface SpotPair {
   coin: string;       // base token name, e.g. "HYPE"
   pairName: string;   // identifier for l2Book / mids, e.g. "HYPE/USDC" or "@107"
@@ -76,6 +87,15 @@ function roundPrice(px: number, szDecimals: number): string {
   return fmtNum(Number(sig.toFixed(maxDecimals)));
 }
 
+interface BuiltSpotOrder {
+  pair: SpotPair;
+  isBuy: boolean;
+  top: number;
+  price: string;
+  size: string;
+  availableBase: number | null;
+}
+
 export class HyperliquidClient {
   /** Master account's spot balances (USDC + tokens). */
   async getSpotState(agentWalletId: string): Promise<HlSpotState> {
@@ -109,14 +129,10 @@ export class HyperliquidClient {
     return out;
   }
 
-  /** Place a marketable spot order (IOC) signed by the API wallet, on behalf of the master account. */
-  async placeSpotOrder(
+  private async buildSpotOrder(
     agentWalletId: string,
     params: { coin: string; side: 'BUY' | 'SELL'; usdcAmount?: number; fraction?: number },
-  ): Promise<HlOrderResult & { coin: string; pair: string; price: number; size: number }> {
-    const creds = getHlCreds(agentWalletId);
-    if (!creds) throw new Error('No Hyperliquid API wallet configured for this agent.');
-
+  ): Promise<BuiltSpotOrder> {
     const pair = await resolveSpotPair(params.coin);
     if (!pair) throw new Error(`Unknown Hyperliquid spot coin: ${params.coin}`);
 
@@ -132,21 +148,67 @@ export class HyperliquidClient {
     const slip = 0.01;
     const price = roundPrice(isBuy ? top * (1 + slip) : top * (1 - slip), pair.szDecimals);
 
-    // Size: notional/price for amount-based orders; fraction of held tokens for fractional sells.
     let sizeNum: number;
-    if (!isBuy && params.fraction !== undefined && params.usdcAmount === undefined) {
+    let availableBase: number | null = null;
+    if (!isBuy) {
       const state = await this.getSpotState(agentWalletId);
-      const held = state.balances.find(b => b.coin.toUpperCase() === pair.coin.toUpperCase())?.total ?? 0;
-      sizeNum = held * params.fraction;
+      const balance = state.balances.find(b => b.coin.toUpperCase() === pair.coin.toUpperCase());
+      availableBase = Math.max(0, (balance?.total ?? 0) - (balance?.hold ?? 0));
+
+      if (params.fraction !== undefined && params.usdcAmount === undefined) {
+        if (!(params.fraction > 0 && params.fraction <= 1)) {
+          throw new Error('Sell fraction must be greater than 0 and at most 1.0.');
+        }
+        sizeNum = availableBase * params.fraction;
+      } else {
+        const usd = params.usdcAmount ?? 0;
+        sizeNum = usd / top;
+      }
+
+      if (sizeNum > availableBase) {
+        throw new Error(`Insufficient ${pair.coin} to sell: requested ${sizeNum.toFixed(pair.szDecimals)}, available ${availableBase.toFixed(pair.szDecimals)}.`);
+      }
     } else {
       const usd = params.usdcAmount ?? 0;
       sizeNum = usd / top;
     }
+
     const size = roundSize(sizeNum, pair.szDecimals);
-    // Order size is bounded by the signed policy (hyperliquid.maxOrderSizeUSDC), checked upstream.
     if (Number(size) <= 0) {
       throw new Error(`Computed size is zero — ${pair.coin} trades in steps of ${1 / (10 ** pair.szDecimals)} (~$${(top / (10 ** pair.szDecimals)).toFixed(2)}); increase the amount.`);
     }
+
+    return { pair, isBuy, top, price, size, availableBase };
+  }
+
+  async previewSpotOrder(
+    agentWalletId: string,
+    params: { coin: string; side: 'BUY' | 'SELL'; usdcAmount?: number; fraction?: number },
+  ): Promise<HlSpotOrderPreview> {
+    const built = await this.buildSpotOrder(agentWalletId, params);
+    const size = Number(built.size);
+    const limitPrice = Number(built.price);
+    return {
+      coin: built.pair.coin,
+      pair: built.pair.pairName,
+      side: params.side,
+      topPrice: built.top,
+      limitPrice,
+      size,
+      notionalUsdc: size * built.top,
+      availableBase: built.availableBase,
+    };
+  }
+
+  /** Place a marketable spot order (IOC) signed by the API wallet, on behalf of the master account. */
+  async placeSpotOrder(
+    agentWalletId: string,
+    params: { coin: string; side: 'BUY' | 'SELL'; usdcAmount?: number; fraction?: number },
+  ): Promise<HlOrderResult & { coin: string; pair: string; price: number; size: number }> {
+    const creds = getHlCreds(agentWalletId);
+    if (!creds) throw new Error('No Hyperliquid API wallet configured for this agent.');
+
+    const { pair, isBuy, price, size } = await this.buildSpotOrder(agentWalletId, params);
 
     const account = privateKeyToAccount(creds.privateKey as `0x${string}`);
     const exchange = new ExchangeClient({ transport, wallet: account });
