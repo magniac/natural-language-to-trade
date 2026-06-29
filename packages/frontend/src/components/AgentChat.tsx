@@ -21,6 +21,7 @@ interface ChatMessage {
 const TOOL_LABELS: Record<string, string> = {
   search_markets: 'Searched markets',
   search_hyperliquid_markets: 'Searched Hyperliquid',
+  set_hyperliquid_leverage: 'Set Hyperliquid leverage',
   get_portfolio: 'Checked portfolio',
   place_trade: 'Placed trade',
 };
@@ -28,6 +29,7 @@ const TOOL_LABELS: Record<string, string> = {
 const TOOL_ICONS: Record<string, string> = {
   search_markets: '🔍',
   search_hyperliquid_markets: '🪙',
+  set_hyperliquid_leverage: '⚙',
   get_portfolio: '📊',
   place_trade: '💱',
 };
@@ -86,14 +88,19 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
           })()}
 
           {tc.name === 'search_hyperliquid_markets' && (() => {
-            const r = tc.result as { markets?: Array<{ title: string; coin: string; price: number | null }> } | undefined;
+            const r = tc.result as { markets?: Array<{ title: string; coin: string; price: number | null; marketType?: 'spot' | 'perp'; maxLeverage?: number }> } | undefined;
             if (!r?.markets?.length) return <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>No Hyperliquid coins found.</p>;
             return (
               <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {r.markets.map((m, i) => (
                   <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
-                    <span style={{ color: '#e2e8f0' }}>{m.coin}</span>
-                    <span style={{ color: '#4ade80', whiteSpace: 'nowrap' }}>{m.price != null ? `$${m.price}` : '?'}</span>
+                    <span style={{ color: '#e2e8f0' }}>
+                      {m.coin}
+                      <span style={{ color: '#6b7280', marginLeft: 6 }}>{m.marketType === 'perp' ? 'perp' : 'spot'}</span>
+                    </span>
+                    <span style={{ color: '#4ade80', whiteSpace: 'nowrap' }}>
+                      {m.price != null ? `$${m.price}` : '?'}{m.marketType === 'perp' && m.maxLeverage ? <span style={{ color: '#6b7280', marginLeft: 6 }}>{m.maxLeverage}x</span> : null}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -101,7 +108,16 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
           })()}
 
           {tc.name === 'get_portfolio' && (() => {
-            const r = tc.result as { budgetRemainingUSDC?: string; dailySpendUSDC?: string; openPositions?: Array<{ market: string; outcome: string; shares: string }>; hyperliquid?: { usdc: string; balances: Array<{ coin: string; total: string }> } | null } | undefined;
+            const r = tc.result as {
+              budgetRemainingUSDC?: string;
+              dailySpendUSDC?: string;
+              openPositions?: Array<{ market: string; outcome: string; shares: string }>;
+              hyperliquid?: {
+                usdc: string;
+                balances: Array<{ coin: string; total: string }>;
+                perps?: { accountValue: string; withdrawable: string; totalNtlPos: string; positions: Array<{ coin: string; side: 'LONG' | 'SHORT'; size: string; value: string; entryPx: string; pnl: string; leverage: number; liquidationPx: string | null }> } | null;
+              } | null;
+            } | undefined;
             return (
               <div style={{ marginTop: 8, fontSize: 12, color: '#a0aec0' }}>
                 <p>Budget remaining: <strong style={{ color: '#e2e8f0' }}>${r?.budgetRemainingUSDC}</strong></p>
@@ -120,20 +136,53 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
                     {r.hyperliquid.balances.map((b, i) => (
                       <p key={i}>{b.total} {b.coin}</p>
                     ))}
+                    {r.hyperliquid.perps && (
+                      <div style={{ marginTop: 6 }}>
+                        <p style={{ color: '#6b7280', marginBottom: 4 }}>Hyperliquid perps: <strong style={{ color: '#e2e8f0' }}>${r.hyperliquid.perps.accountValue} account value</strong> · ${r.hyperliquid.perps.withdrawable} withdrawable</p>
+                        {r.hyperliquid.perps.positions.map((p, i) => (
+                          <p key={i}>{p.side} {p.size} {p.coin} · ${p.value} notional · PnL ${p.pnl}</p>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             );
           })()}
 
+          {tc.name === 'set_hyperliquid_leverage' && (() => {
+            const r = tc.result as { success?: boolean; policyDenied?: boolean; coin?: string; market?: string; leverage?: number; marginMode?: 'cross' | 'isolated'; maxLeverage?: number; reasons?: string[]; error?: string } | undefined;
+            if (r?.success) {
+              return (
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  <p style={{ color: '#4ade80', marginBottom: 4 }}>Hyperliquid leverage updated</p>
+                  <p style={{ color: '#a0aec0' }}>{r.market ?? `${r.coin}-PERP`} · {r.leverage}x · {r.marginMode ?? 'cross'}</p>
+                  {r.maxLeverage != null && <p style={{ color: '#6b7280' }}>Exchange max {r.maxLeverage}x</p>}
+                </div>
+              );
+            }
+            if (r?.policyDenied) return (
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                <p style={{ color: '#f87171', marginBottom: 4 }}>Policy engine denied the leverage update</p>
+                {r.reasons?.map((reason, i) => <p key={i} style={{ color: '#6b7280' }}>• {reason}</p>)}
+              </div>
+            );
+            return (
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                <p style={{ color: '#f87171' }}>{r?.error ?? tc.error ?? 'Leverage update failed'}</p>
+              </div>
+            );
+          })()}
+
           {tc.name === 'place_trade' && (() => {
-            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; venue?: string; status?: string | null; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; coin?: string; price?: number; size?: number; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; oid?: number; resting?: boolean; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
+            const r = tc.result as { success?: boolean; mode?: 'paper' | 'live'; venue?: string; marketType?: 'spot' | 'perp'; reduceOnly?: boolean; status?: string | null; policyDenied?: boolean; ambiguous?: boolean; market?: string; side?: string; outcome?: string; coin?: string; price?: number; size?: number; fillPrice?: number; fillSize?: number; limitPrice?: number; orderValue?: number; clobOrderId?: string; oid?: number; resting?: boolean; reasons?: string[]; error?: string; candidates?: Array<{ id: string; title: string }> } | undefined;
             if (r?.success && r.venue === 'hyperliquid') {
               const filled = (r.fillSize ?? 0) > 0;
               return (
                 <div style={{ marginTop: 8, fontSize: 12 }}>
-                  <p style={{ color: '#4ade80', marginBottom: 4 }}>{filled ? 'Hyperliquid order filled' : 'Hyperliquid order submitted'}</p>
+                  <p style={{ color: '#4ade80', marginBottom: 4 }}>{filled ? `Hyperliquid ${r.marketType ?? 'spot'} order filled` : `Hyperliquid ${r.marketType ?? 'spot'} order submitted`}</p>
                   <p style={{ color: '#a0aec0' }}>{r.side} {filled ? r.fillSize : r.size} {r.coin} @ ${(r.fillPrice ?? r.price)?.toFixed(4)}</p>
+                  {r.reduceOnly && <p style={{ color: '#6b7280' }}>reduce-only close</p>}
                   <p style={{ color: '#6b7280' }}>{r.market}</p>
                   {r.oid != null && <p style={{ color: '#4b5563', fontFamily: 'monospace', fontSize: 11 }}>oid {r.oid}</p>}
                 </div>

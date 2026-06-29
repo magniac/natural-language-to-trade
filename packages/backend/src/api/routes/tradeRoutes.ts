@@ -37,6 +37,15 @@ async function getWalletBalanceUsdc(agentWalletId: string): Promise<number | nul
 
 const router = Router();
 
+const NET_SPEND_EXPR = `
+  CASE
+    WHEN o.venue = 'hyperliquid-perp' THEN
+      CASE WHEN json_extract(f.raw_json, '$.reduceOnly') = 1 THEN -(f.price * f.size) ELSE f.price * f.size END
+    WHEN o.side = 'BUY' THEN f.price * f.size
+    ELSE -(f.price * f.size)
+  END
+`;
+
 // In-memory simulator states (per agent wallet) — replace with DB persistence in prod
 const simulatorStates: Map<string, ReturnType<typeof createSimulatorState>> = new Map();
 
@@ -458,7 +467,7 @@ router.get('/portfolio', async (req, res) => {
       COUNT(DISTINCT o.id) as total_orders,
       COUNT(DISTINCT CASE WHEN f.id IS NOT NULL THEN o.id END) as filled_orders,
       COUNT(DISTINCT CASE WHEN o.status IN ('open', 'pending', 'partially_filled') THEN o.id END) as open_orders,
-      COALESCE(SUM(CASE WHEN o.side = 'BUY' THEN f.price * f.size ELSE -(f.price * f.size) END), 0) as total_spent_usdc
+      COALESCE(SUM(${NET_SPEND_EXPR}), 0) as total_spent_usdc
     FROM orders o
     LEFT JOIN fills f ON f.order_id = o.id
     WHERE o.agent_wallet_id = ?
@@ -521,15 +530,47 @@ router.get('/portfolio', async (req, res) => {
 
   const walletBalanceUsdc = await getWalletBalanceUsdc(agentWalletId);
 
-  // Live Hyperliquid spot balances (master account), when an API wallet is configured.
-  let hyperliquid: { usdc: number; balances: { coin: string; total: number }[] } | null = null;
+  // Live Hyperliquid balances and perp positions (master account), when an API wallet is configured.
+  let hyperliquid: {
+    usdc: number;
+    balances: { coin: string; total: number }[];
+    perps: { accountValue: number; withdrawable: number; totalNtlPos: number; totalMarginUsed: number; positions: { coin: string; side: 'LONG' | 'SHORT'; size: number; value: number; entryPx: number; pnl: number; leverage: number; liquidationPx: number | null }[] } | null;
+  } | null = null;
   if (hasHlCreds(agentWalletId)) {
+    const hlClient = new HyperliquidClient();
+    let spot: { usdc: number; balances: { coin: string; total: number }[] } | null = null;
+    let perps: Awaited<ReturnType<HyperliquidClient['getPerpState']>> | null = null;
     try {
-      const state = await new HyperliquidClient().getSpotState(agentWalletId);
-      hyperliquid = { usdc: state.usdc, balances: state.balances.filter(b => b.coin !== 'USDC') };
+      const state = await hlClient.getSpotState(agentWalletId);
+      spot = { usdc: state.usdc, balances: state.balances.filter(b => b.coin !== 'USDC') };
     } catch (err) {
-      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid balance fetch failed');
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid spot balance fetch failed');
     }
+    try {
+      perps = await hlClient.getPerpState(agentWalletId);
+    } catch (err) {
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid perp state fetch failed');
+    }
+    if (spot || perps) hyperliquid = {
+      usdc: spot?.usdc ?? 0,
+      balances: spot?.balances ?? [],
+      perps: perps ? {
+        accountValue: perps.accountValue,
+        withdrawable: perps.withdrawable,
+        totalNtlPos: perps.totalNtlPos,
+        totalMarginUsed: perps.totalMarginUsed,
+        positions: perps.positions.map(p => ({
+          coin: p.coin,
+          side: p.side,
+          size: Math.abs(p.szi),
+          value: p.positionValue,
+          entryPx: p.entryPx,
+          pnl: p.unrealizedPnl,
+          leverage: p.leverage,
+          liquidationPx: p.liquidationPx,
+        })),
+      } : null,
+    };
   }
 
   return res.json({

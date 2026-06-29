@@ -1,7 +1,8 @@
 import React from 'react';
 import { ethers } from 'ethers';
+import { ExchangeClient, HttpTransport } from '@nktkas/hyperliquid';
 import { api } from '../lib/api';
-import { signPolicyEIP712 } from '../lib/wallet';
+import { signPolicyEIP712, freshProvider, providerForChain } from '../lib/wallet';
 import { saveSession, saveAgentWallet, loadAgentWallet, loadSession, getSessionStatus, clearAgentWallet, clearSession, type PersistedAgentWallet } from '../lib/sessionSigner';
 import Card from './Card';
 import Button from './Button';
@@ -18,6 +19,43 @@ interface AgentInfo {
   proxyWalletAddress?: string;
   policyId?: string;
   status: string;
+}
+
+type HlAccountAbstraction = 'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default' | 'dexAbstraction';
+type HlBalance = {
+  usdc: number;
+  balances: { coin: string; total: number }[];
+  accountAbstraction?: HlAccountAbstraction | null;
+  portfolioMarginEnabled?: boolean;
+  perps?: {
+    accountValue: number;
+    withdrawable: number;
+    totalNtlPos: number;
+    totalMarginUsed: number;
+    positions: { coin: string; side: 'LONG' | 'SHORT'; szi: number; positionValue: number; unrealizedPnl: number; leverage: number }[];
+  } | null;
+};
+
+const HL_UNIFIED_PERP_FUNDING_MESSAGE = 'Unified account mode is active on Hyperliquid, so spot and perp collateral are shared. No separate perp funding transfer is needed.';
+
+function hasUnifiedHlCollateral(balance: HlBalance | null): boolean {
+  return balance?.accountAbstraction === 'unifiedAccount' || balance?.accountAbstraction === 'portfolioMargin' || balance?.portfolioMarginEnabled === true;
+}
+
+function formatHlAccountMode(mode?: HlAccountAbstraction | null): string {
+  switch (mode) {
+    case 'unifiedAccount': return 'unified account';
+    case 'portfolioMargin': return 'portfolio margin';
+    case 'dexAbstraction': return 'DEX abstraction';
+    case 'disabled': return 'disabled';
+    case 'default': return 'default';
+    default: return 'unknown';
+  }
+}
+
+function normalizeHlPerpFundingError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : 'Perp funding failed';
+  return msg.toLowerCase().includes('unified account') ? HL_UNIFIED_PERP_FUNDING_MESSAGE : msg;
 }
 
 export default function AgentSetup({ wallet }: Props) {
@@ -47,11 +85,12 @@ export default function AgentSetup({ wallet }: Props) {
   // Allowed operations
   const [allowBuy, setAllowBuy] = React.useState(persisted?.allowBuy ?? true);
   const [allowSell, setAllowSell] = React.useState(persisted?.allowSell ?? true);
-  // Hyperliquid venue (spot)
+  // Hyperliquid venue (spot + perps)
   const [allowHyperliquid, setAllowHyperliquid] = React.useState(persisted?.allowHyperliquid ?? false);
   const [hlAllowedCoins, setHlAllowedCoins] = React.useState(persisted?.hlAllowedCoins ?? '');
   const [hlMaxOrder, setHlMaxOrder] = React.useState(persisted?.hlMaxOrder ?? '1');
   const [hlSlippageBps, setHlSlippageBps] = React.useState(persisted?.hlSlippageBps ?? '100');
+  const [hlMaxLeverage, setHlMaxLeverage] = React.useState(persisted?.hlMaxLeverage ?? '3');
   const [signedPolicyId, setSignedPolicyId] = React.useState<string | null>(persisted?.policyId ?? null);
   const [clobStatus, setClobStatus] = React.useState<'unknown' | 'none' | 'active' | 'deriving' | 'error'>('unknown');
   const [clobDerivedAt, setClobDerivedAt] = React.useState<string | null>(null);
@@ -70,10 +109,13 @@ export default function AgentSetup({ wallet }: Props) {
   const [hlKeyInput, setHlKeyInput] = React.useState('');
   const [hlKeySaving, setHlKeySaving] = React.useState(false);
   const [hlKeyError, setHlKeyError] = React.useState<string | null>(null);
-  const [hlBalance, setHlBalance] = React.useState<{ usdc: number; balances: { coin: string; total: number }[] } | null>(null);
+  const [hlBalance, setHlBalance] = React.useState<HlBalance | null>(null);
   const [hlDepositAmount, setHlDepositAmount] = React.useState('10');
   const [hlDepositError, setHlDepositError] = React.useState<string | null>(null);
   const [hlDepositing, setHlDepositing] = React.useState(false);
+  const [hlPerpFundAmount, setHlPerpFundAmount] = React.useState('10');
+  const [hlPerpFundError, setHlPerpFundError] = React.useState<string | null>(null);
+  const [hlPerpFunding, setHlPerpFunding] = React.useState(false);
   const [paperMode, setPaperMode] = React.useState(true);
   const [serverLiveEnabled, setServerLiveEnabled] = React.useState(false);
   const [modeSaving, setModeSaving] = React.useState(false);
@@ -124,6 +166,7 @@ export default function AgentSetup({ wallet }: Props) {
       hlAllowedCoins,
       hlMaxOrder,
       hlSlippageBps,
+      hlMaxLeverage,
       ...overrides,
     });
   }
@@ -277,8 +320,8 @@ export default function AgentSetup({ wallet }: Props) {
     const fundTarget = agent.proxyWalletAddress;
     setFundError(null);
     try {
-      await wallet.provider.send('wallet_switchEthereumChain', [{ chainId: '0x89' }]);
-      const signer = await wallet.provider.getSigner();
+      const provider = await providerForChain('0x89'); // Polygon
+      const signer = await provider.getSigner();
       const pUSD = new ethers.Contract(
         PUSD_ADDRESS,
         ['function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)'],
@@ -317,7 +360,7 @@ export default function AgentSetup({ wallet }: Props) {
     if (!agent || wallet.status !== 'connected') return;
     setWithdrawing(true); setFundError(null);
     try {
-      const to = await wallet.provider.getSigner().then(s => s.getAddress());
+      const to = await freshProvider().getSigner().then(s => s.getAddress());
       const r = await fetch(`/api/agents/${agent.agentWalletId}/withdraw`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -337,8 +380,9 @@ export default function AgentSetup({ wallet }: Props) {
   const connectedWalletAddress = wallet.status === 'connected' ? wallet.address : null;
   React.useEffect(() => {
     if (!connectedWalletAddress || step !== 'done') return;
-    const provider = (wallet as { provider?: ethers.BrowserProvider }).provider;
-    if (!provider) return;
+    // Read-only Polygon RPC so this display read works regardless of which chain MetaMask is
+    // currently on (e.g. Arbitrum after a Hyperliquid action) and never poisons a shared provider.
+    const provider = new ethers.JsonRpcProvider('https://polygon-bor-rpc.publicnode.com');
     const pUSD = new ethers.Contract(
       PUSD_ADDRESS,
       ['function balanceOf(address) view returns (uint256)'],
@@ -385,6 +429,7 @@ export default function AgentSetup({ wallet }: Props) {
         hlAllowedCoins,
         hlMaxOrder,
         hlSlippageBps,
+        hlMaxLeverage,
       });
       setImportKeyInput('');
       setClobStatus('none');
@@ -442,7 +487,7 @@ export default function AgentSetup({ wallet }: Props) {
       const newAgent = { agentWalletId: result.agentWalletId, address: result.address, status: 'active' };
       setAgent(newAgent);
       setStep('configuring');
-      saveAgentWallet({ agentWalletId: result.agentWalletId, address: result.address, proxyWalletAddress: undefined, step: 'configuring', budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
+      saveAgentWallet({ agentWalletId: result.agentWalletId, address: result.address, proxyWalletAddress: undefined, step: 'configuring', budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps, hlMaxLeverage });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create agent');
     } finally {
@@ -505,6 +550,7 @@ export default function AgentSetup({ wallet }: Props) {
           maxOrderSizeUSDC: parseFloat(hlMaxOrder) || 1,
           allowedCoins: hlAllowedCoins.split(',').map(c => c.trim().toUpperCase()).filter(Boolean),
           maxSlippageBps: parseInt(hlSlippageBps) || 100,
+          maxLeverage: Math.max(1, parseInt(hlMaxLeverage) || 3),
         },
       };
 
@@ -519,7 +565,7 @@ export default function AgentSetup({ wallet }: Props) {
       const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
       const policyHash = '0x' + Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-      const sig = await signPolicyEIP712(wallet.provider, {
+      const sig = await signPolicyEIP712({
         version: policy.version,
         userWallet: policy.userWallet,
         agentWallet: policy.agentWallet,
@@ -562,7 +608,7 @@ export default function AgentSetup({ wallet }: Props) {
       });
 
       // Persist agent wallet state so tab switches don't reset the UI
-      saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, proxyWalletAddress: agent.proxyWalletAddress, step: 'done', policyId: data.policyId, budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
+      saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, proxyWalletAddress: agent.proxyWalletAddress, step: 'done', policyId: data.policyId, budget, maxOrder, dailyLimit, maxOpenOrders, expiryDays, minLiquidityUSDC, maxSpreadBps, nearResolutionHours, maxPrice, allowBuy, allowSell, allowHyperliquid, hlAllowedCoins, hlMaxOrder, hlSlippageBps, hlMaxLeverage });
 
       setStep('done');
 
@@ -677,7 +723,11 @@ export default function AgentSetup({ wallet }: Props) {
     if (!agent) return;
     try {
       const r = await fetch(`/api/agents/${agent.agentWalletId}/hyperliquid-balance`);
-      if (r.ok) setHlBalance(await r.json() as { usdc: number; balances: { coin: string; total: number }[] });
+      if (r.ok) {
+        const balance = await r.json() as HlBalance;
+        setHlBalance(balance);
+        if (hasUnifiedHlCollateral(balance)) setHlPerpFundError(null);
+      }
     } catch { /* ignore */ }
   }
 
@@ -717,8 +767,8 @@ export default function AgentSetup({ wallet }: Props) {
     try {
       const amt = parseFloat(hlDepositAmount);
       if (!(amt >= 5)) throw new Error('Hyperliquid requires a minimum deposit of 5 USDC.');
-      await wallet.provider.send('wallet_switchEthereumChain', [{ chainId: ARBITRUM_CHAIN }]);
-      const signer = await wallet.provider.getSigner();
+      const provider = await providerForChain(ARBITRUM_CHAIN);
+      const signer = await provider.getSigner();
       const usdc = new ethers.Contract(
         ARB_USDC,
         ['function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)'],
@@ -740,6 +790,37 @@ export default function AgentSetup({ wallet }: Props) {
       setHlDepositing(false);
     }
   }
+
+  async function fundHyperliquidPerps() {
+    if (!agent || wallet.status !== 'connected') return;
+    setHlPerpFundError(null); setHlPerpFunding(true);
+    try {
+      const amountText = hlPerpFundAmount.trim();
+      const amt = parseFloat(amountText);
+      if (!(amt > 0)) throw new Error('Enter a USDC amount greater than 0.');
+      if (hasUnifiedHlCollateral(hlBalance)) throw new Error(HL_UNIFIED_PERP_FUNDING_MESSAGE);
+      if (hlBalance && amt > hlBalance.usdc) {
+        throw new Error(`Hyperliquid spot balance is only $${hlBalance.usdc.toFixed(2)} USDC. Deposit to Hyperliquid first, then fund perps.`);
+      }
+
+      const provider = await providerForChain(ARBITRUM_CHAIN);
+      const signer = await provider.getSigner();
+      const exchange = new ExchangeClient({
+        transport: new HttpTransport(),
+        wallet: signer,
+        signatureChainId: ARBITRUM_CHAIN as `0x${string}`,
+      });
+      await exchange.usdClassTransfer({ amount: String(amt), toPerp: true });
+      setTimeout(() => void refreshHlBalance(), 2500);
+      setTimeout(() => void refreshHlBalance(), 8000);
+    } catch (err) {
+      setHlPerpFundError(normalizeHlPerpFundingError(err));
+    } finally {
+      setHlPerpFunding(false);
+    }
+  }
+
+  const hlUnifiedCollateral = hasUnifiedHlCollateral(hlBalance);
 
   async function pauseAgent() {
     if (!agent) return;
@@ -915,17 +996,18 @@ export default function AgentSetup({ wallet }: Props) {
                 checked={allowHyperliquid}
                 onChange={e => {
                   setAllowHyperliquid(e.target.checked);
-                  if (agent) saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, step: 'configuring', allowHyperliquid: e.target.checked, hlAllowedCoins, hlMaxOrder, hlSlippageBps });
+                  if (agent) saveAgentWallet({ agentWalletId: agent.agentWalletId, address: agent.address, step: 'configuring', allowHyperliquid: e.target.checked, hlAllowedCoins, hlMaxOrder, hlSlippageBps, hlMaxLeverage });
                 }}
                 style={{ accentColor: '#6366f1', width: 16, height: 16 }}
               />
-              Hyperliquid (crypto spot, mainnet — real funds)
+              Hyperliquid (crypto spot + perps, mainnet — real funds)
             </label>
             {allowHyperliquid && (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginTop: 12 }}>
                 {([
-                  { label: 'HL Max Order (USDC)', value: hlMaxOrder, set: setHlMaxOrder, key: 'hlMaxOrder', placeholder: 'e.g. 1', hint: 'Per HL spot order' },
+                  { label: 'HL Max Order (USDC)', value: hlMaxOrder, set: setHlMaxOrder, key: 'hlMaxOrder', placeholder: 'e.g. 1', hint: 'Per HL spot order or perp notional' },
                   { label: 'HL Max Slippage (bps)', value: hlSlippageBps, set: setHlSlippageBps, key: 'hlSlippageBps', placeholder: 'e.g. 100', hint: '100 = 1%' },
+                  { label: 'HL Max Leverage', value: hlMaxLeverage, set: setHlMaxLeverage, key: 'hlMaxLeverage', placeholder: 'e.g. 3', hint: 'Per perp coin setting' },
                 ] as const).map(({ label, value, set, key: fieldKey, placeholder, hint }) => (
                   <div key={label}>
                     <label style={{ fontSize: 12, color: '#6b7280', display: 'block', marginBottom: 6 }}>{label}</label>
@@ -1408,14 +1490,14 @@ export default function AgentSetup({ wallet }: Props) {
             {hlKeyStatus === 'active' ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <p style={{ fontSize: 12, color: '#4b5563', flex: 1 }}>
-                  API wallet stored. It signs spot orders for your connected wallet (the master account that holds funds). It cannot withdraw.
+                  API wallet stored. It signs spot orders, perp orders, and perp leverage updates for your connected wallet (the master account that holds funds). It cannot withdraw.
                 </p>
                 <button onClick={removeHlKey} style={{ fontSize: 11, padding: '3px 10px', borderRadius: 6, background: '#7f1d1d44', border: '1px solid #7f1d1d', color: '#f87171', cursor: 'pointer' }}>Remove</button>
               </div>
             ) : (
               <>
                 <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 10, lineHeight: 1.5 }}>
-                  Paste the <strong style={{ color: '#a0aec0' }}>API wallet</strong> address + secret key you generated on Hyperliquid (More → API). It signs orders on behalf of your connected main wallet (the fund holder). Stored encrypted; cannot withdraw.
+                  Paste the <strong style={{ color: '#a0aec0' }}>API wallet</strong> address + secret key you generated on Hyperliquid (More → API). It signs spot orders, perp orders, and perp leverage updates on behalf of your connected main wallet (the fund holder). Stored encrypted; cannot withdraw.
                 </p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   <input type="text" value={hlAddrInput} onChange={e => setHlAddrInput(e.target.value)} placeholder="API wallet address (0x…)"
@@ -1442,7 +1524,19 @@ export default function AgentSetup({ wallet }: Props) {
               </div>
               {hlBalance && hlBalance.balances.length > 0 && (
                 <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 10 }}>
-                  Holdings: {hlBalance.balances.map(b => `${b.total} ${b.coin}`).join(', ')}
+                  Spot holdings: {hlBalance.balances.map(b => `${b.total} ${b.coin}`).join(', ')}
+                </p>
+              )}
+              {hlBalance?.perps && (
+                <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 10 }}>
+                  Perps: ${hlBalance.perps.accountValue.toFixed(2)} account value · ${hlBalance.perps.withdrawable.toFixed(2)} withdrawable
+                  {hlBalance.perps.positions.length > 0 ? ` · ${hlBalance.perps.positions.length} open position${hlBalance.perps.positions.length === 1 ? '' : 's'}` : ''}
+                </p>
+              )}
+              {hlBalance && (
+                <p style={{ fontSize: 11, color: hlUnifiedCollateral ? '#93c5fd' : '#6b7280', marginBottom: 10 }}>
+                  Account mode: {formatHlAccountMode(hlBalance.accountAbstraction)}
+                  {hlBalance.portfolioMarginEnabled ? ' · portfolio margin enabled' : ''}
                 </p>
               )}
               <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, lineHeight: 1.5 }}>
@@ -1457,6 +1551,28 @@ export default function AgentSetup({ wallet }: Props) {
                 <button onClick={refreshHlBalance} style={{ fontSize: 11, color: '#4b5563', background: 'none', border: 'none', cursor: 'pointer' }}>Refresh</button>
               </div>
               {hlDepositError && <p style={{ fontSize: 12, color: '#f87171', marginTop: 6 }}>{hlDepositError}</p>}
+
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #2d3748' }}>
+                {hlUnifiedCollateral ? (
+                  <p style={{ fontSize: 12, color: '#93c5fd', marginBottom: 0, lineHeight: 1.5 }}>
+                    Unified collateral is active, so Hyperliquid shares spot and perp collateral for this account. Separate spot-to-perp funding transfers are disabled and not needed.
+                  </p>
+                ) : (
+                  <>
+                    <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, lineHeight: 1.5 }}>
+                      Fund the perp account by moving USDC from your Hyperliquid spot balance to Hyperliquid perps.
+                    </p>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <input type="number" value={hlPerpFundAmount} onChange={e => setHlPerpFundAmount(e.target.value)} min={0}
+                        style={{ width: 90, padding: '7px 10px', borderRadius: 6, fontSize: 13, background: '#1a1d27', border: '1px solid #2d3748', color: '#e2e8f0', outline: 'none' }} />
+                      <Button size="sm" variant="ghost" onClick={fundHyperliquidPerps} loading={hlPerpFunding} disabled={wallet.status !== 'connected' || !hlBalance || hlBalance.usdc <= 0 || hlUnifiedCollateral}>
+                        Fund Perps
+                      </Button>
+                    </div>
+                  </>
+                )}
+                {hlPerpFundError && <p style={{ fontSize: 12, color: '#f87171', marginTop: 6 }}>{hlPerpFundError}</p>}
+              </div>
             </div>
           )}
 

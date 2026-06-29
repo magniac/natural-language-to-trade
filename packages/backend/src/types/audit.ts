@@ -35,6 +35,8 @@ export type AuditAction =
   | 'order.cancel_all'
   | 'order.fill'
   | 'order.reconcile'
+  | 'hyperliquid.leverage.updated'
+  | 'hyperliquid.leverage.failed'
   | 'llm.call'
   | 'llm.deny'
   | 'kill_switch.enable'

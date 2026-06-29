@@ -285,8 +285,9 @@ router.get('/:agentId/hyperliquid-balance', async (req, res) => {
     return res.status(404).json({ error: 'Agent not found' });
   }
   try {
-    const state = await new HyperliquidClient().getSpotState(agentId);
-    return res.json(state);
+    const client = new HyperliquidClient();
+    const [spot, perps] = await Promise.all([client.getSpotState(agentId), client.getPerpState(agentId)]);
+    return res.json({ ...spot, perps });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Hyperliquid read failed';
     logger.warn({ agentId, err }, 'hyperliquid-balance failed');

@@ -40,7 +40,17 @@ interface PortfolioData {
   };
   positions: Position[];
   recentOrders: Order[];
-  hyperliquid: { usdc: number; balances: { coin: string; total: number }[] } | null;
+  hyperliquid: {
+    usdc: number;
+    balances: { coin: string; total: number }[];
+    perps?: {
+      accountValue: number;
+      withdrawable: number;
+      totalNtlPos: number;
+      totalMarginUsed: number;
+      positions: { coin: string; side: 'LONG' | 'SHORT'; size: number; value: number; entryPx: number; pnl: number; leverage: number; liquidationPx: number | null }[];
+    } | null;
+  } | null;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -240,13 +250,14 @@ export default function Portfolio({ hideTitle = false }: { hideTitle?: boolean }
         )}
       </Card>
 
-      {/* Hyperliquid spot balances */}
+      {/* Hyperliquid balances */}
       {hyperliquid && (
         <Card>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: '#e2e8f0' }}>Hyperliquid (spot)</h3>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: '#e2e8f0' }}>Hyperliquid</h3>
             <span style={{ fontSize: 13, color: hyperliquid.usdc > 0 ? '#4ade80' : '#6b7280' }}>${hyperliquid.usdc.toFixed(2)} USDC</span>
           </div>
+          <p style={{ fontSize: 12, color: '#6b7280', marginBottom: 8 }}>Spot balances</p>
           {hyperliquid.balances.length === 0 ? (
             <p style={{ fontSize: 12, color: '#6b7280' }}>No token holdings yet.</p>
           ) : (
@@ -257,6 +268,32 @@ export default function Portfolio({ hideTitle = false }: { hideTitle?: boolean }
                   <span style={{ color: '#a0aec0' }}>{b.total}</span>
                 </div>
               ))}
+            </div>
+          )}
+          {hyperliquid.perps && (
+            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid #2d3748' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 8, fontSize: 12 }}>
+                <span style={{ color: '#6b7280' }}>Perp account value</span>
+                <span style={{ color: hyperliquid.perps.accountValue > 0 ? '#4ade80' : '#6b7280' }}>${fmt(hyperliquid.perps.accountValue, 2)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 8, fontSize: 12 }}>
+                <span style={{ color: '#6b7280' }}>Perp withdrawable</span>
+                <span style={{ color: '#a0aec0' }}>${fmt(hyperliquid.perps.withdrawable, 2)}</span>
+              </div>
+              {hyperliquid.perps.positions.length === 0 ? (
+                <p style={{ fontSize: 12, color: '#6b7280' }}>No perp positions.</p>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {hyperliquid.perps.positions.map((p, i) => (
+                    <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, fontSize: 13 }}>
+                      <span style={{ color: '#e2e8f0' }}>{p.side} {fmt(p.size, 4)} {p.coin}</span>
+                      <span style={{ color: p.pnl >= 0 ? '#4ade80' : '#f87171' }}>${fmt(p.pnl, 2)}</span>
+                      <span style={{ color: '#6b7280', fontSize: 12 }}>${fmt(p.value, 2)} notional · {p.leverage}x</span>
+                      <span style={{ color: '#6b7280', fontSize: 12 }}>entry ${fmt(p.entryPx, 4)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </Card>

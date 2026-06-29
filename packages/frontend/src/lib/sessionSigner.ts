@@ -32,11 +32,12 @@ export interface PersistedAgentWallet {
   // Allowed sides
   allowBuy?: boolean;
   allowSell?: boolean;
-  // Hyperliquid venue (spot)
+  // Hyperliquid venue (spot + perps)
   allowHyperliquid?: boolean;
   hlAllowedCoins?: string;   // comma-separated; '' = any
   hlMaxOrder?: string;
   hlSlippageBps?: string;
+  hlMaxLeverage?: string;
 }
 
 export function saveAgentWallet(info: PersistedAgentWallet): void {

@@ -5,7 +5,7 @@ import { logger } from '../utils/logger';
 import { searchMarketsByKeywords, upsertMarket } from '../market/marketRepository';
 import { resolveMarket, resolveMarketById } from '../market/marketResolver';
 import { fetchGammaMarketById } from '../market/polymarketGammaClient';
-import { runPolicyEngine, runHyperliquidPolicy, type AccountState, type UsageState, type MarketState } from '../policy/policyEngine';
+import { runPolicyEngine, runHyperliquidPolicy, runHyperliquidLeveragePolicy, type AccountState, type UsageState, type MarketState } from '../policy/policyEngine';
 import { HyperliquidClient } from '../clob/hyperliquidClient';
 import { hasHlCreds } from '../utils/hyperliquidKeyStore';
 import { simulateTrade, createSimulatorState } from '../simulator/paperTradingSimulator';
@@ -63,6 +63,25 @@ export function buildToolFallbackResponse(toolCalls: ExecutedToolCall[]): string
     return found === null
       ? 'I searched the available markets. See the results below.'
       : `I found ${found} matching market${found === 1 ? '' : 's'}. See the results below.`;
+  }
+
+  if (last.name === 'search_hyperliquid_markets') {
+    const found = typeof result?.found === 'number' ? result.found : null;
+    return found === null
+      ? 'I searched Hyperliquid markets. See the results below.'
+      : `I found ${found} matching Hyperliquid market${found === 1 ? '' : 's'}. See the results below.`;
+  }
+
+  if (last.name === 'set_hyperliquid_leverage') {
+    if (result?.success === true) {
+      return 'The Hyperliquid leverage setting was updated successfully. See the details below.';
+    }
+    if (result?.policyDenied === true) {
+      const reasons = Array.isArray(result.reasons) ? result.reasons.map(String).join('; ') : '';
+      return `I couldn't update leverage because the policy engine denied it${reasons ? `: ${reasons}` : '.'}`;
+    }
+    const error = typeof result?.error === 'string' ? result.error : last.error;
+    return `I couldn't update Hyperliquid leverage${error ? `: ${error}` : '.'}`;
   }
 
   if (last.name === 'get_portfolio') {
@@ -129,11 +148,12 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'search_hyperliquid_markets',
-      description: 'Search Hyperliquid SPOT tokens by name/symbol (e.g. "HYPE", "PURR"). Returns matching coins with current USD prices. Use this for crypto spot trades, NOT for prediction markets.',
+      description: 'Search Hyperliquid crypto markets by name/symbol. Use marketType="spot" for spot tokens and marketType="perp" for perpetual futures.',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Token name or symbol, e.g. "HYPE"' },
+          marketType: { type: 'string', enum: ['spot', 'perp', 'all'], description: 'Which Hyperliquid market set to search. Defaults to spot.' },
         },
         required: ['query'],
       },
@@ -143,29 +163,47 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'get_portfolio',
-      description: 'Get the current portfolio across both venues: budget remaining, Polymarket positions, Hyperliquid spot balances, and recent orders.',
+      description: 'Get the current portfolio across both venues: budget remaining, Polymarket positions, Hyperliquid spot balances, perp margin/positions, and recent orders.',
       parameters: { type: 'object', properties: {} },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'place_trade',
-      description: 'Place a trade on Polymarket (prediction markets) OR Hyperliquid (crypto spot). Set venue accordingly. Only call after the user has explicitly confirmed the exact market/coin, side, and amount.',
+      name: 'set_hyperliquid_leverage',
+      description: 'Set the leverage for a Hyperliquid perpetual futures coin. Only call after the user explicitly asks to adjust leverage or confirms the leverage, coin, and margin mode.',
       parameters: {
         type: 'object',
         properties: {
-          venue: { type: 'string', enum: ['polymarket', 'hyperliquid'], description: 'polymarket = prediction markets (YES/NO outcomes); hyperliquid = crypto spot (e.g. buy HYPE). Defaults to polymarket.' },
+          coin: { type: 'string', description: 'Hyperliquid perp coin symbol, e.g. "BTC", "ETH", "HYPE"' },
+          leverage: { type: 'number', description: 'Whole-number leverage, e.g. 1, 2, 5, 10.' },
+          marginMode: { type: 'string', enum: ['cross', 'isolated'], description: 'Margin mode to set. Defaults to cross.' },
+        },
+        required: ['coin', 'leverage'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'place_trade',
+      description: 'Place a trade on Polymarket (prediction markets) OR Hyperliquid (crypto spot/perps). Set venue accordingly. Only call after the user has explicitly confirmed the exact market/coin, side, market type, and amount.',
+      parameters: {
+        type: 'object',
+        properties: {
+          venue: { type: 'string', enum: ['polymarket', 'hyperliquid'], description: 'polymarket = prediction markets (YES/NO outcomes); hyperliquid = crypto spot/perps. Defaults to polymarket.' },
           // Polymarket fields
           marketQuery: { type: 'string', description: 'POLYMARKET: exact full market title from search results — copy it verbatim' },
           outcome: { type: 'string', enum: ['YES', 'NO'], description: 'POLYMARKET: which outcome token to trade' },
           limitPrice: { type: 'number', description: 'POLYMARKET: limit price 0.01–0.99; omit to use current market price' },
           // Hyperliquid fields
-          coin: { type: 'string', description: 'HYPERLIQUID: token symbol to trade, e.g. "HYPE" (the USDC pair is used)' },
+          coin: { type: 'string', description: 'HYPERLIQUID: token symbol to trade, e.g. "HYPE", "BTC", "ETH"' },
+          marketType: { type: 'string', enum: ['spot', 'perp'], description: 'HYPERLIQUID: spot = token/USDC spot trade; perp = perpetual futures. Defaults to spot.' },
+          reduceOnly: { type: 'boolean', description: 'HYPERLIQUID PERP only: true when closing/reducing an existing position without opening the opposite side.' },
           // Shared
-          side: { type: 'string', enum: ['BUY', 'SELL'], description: 'BUY or SELL' },
-          maxSpendUSDC: { type: 'number', description: 'Max USDC to spend. Required for BUY orders (both venues).' },
-          maxFraction: { type: 'number', description: 'For SELL only: fraction of the current position to sell (1.0 = all, 0.5 = half). Use instead of maxSpendUSDC for sells.' },
+          side: { type: 'string', enum: ['BUY', 'SELL'], description: 'BUY or SELL. For Hyperliquid perps, BUY opens/increases long or closes short; SELL opens/increases short or closes long.' },
+          maxSpendUSDC: { type: 'number', description: 'Max USDC to spend/notional to trade. Required for BUY orders and for opening Hyperliquid perp longs/shorts.' },
+          maxFraction: { type: 'number', description: 'Fraction of the current position to close/reduce (1.0 = all, 0.5 = half). For spot sells this sells token inventory; for perps this creates a reduce-only close order.' },
           rationale: { type: 'string', description: 'Brief reason for the trade' },
           confidence: { type: 'number', description: 'Confidence 0–1 (e.g. 0.8 = 80%)' },
         },
@@ -179,13 +217,35 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 // them for the best semantic match, and ~50 rows (title + short description) is well within context.
 const MARKET_SEARCH_RESULT_LIMIT = 50;
 
+// Shared spend accounting. Spot and Polymarket sells reduce exposure, but opening
+// a perp short is still risk-increasing, so non-reduce-only perp fills count positive.
+const NET_SPEND_EXPR = `
+  CASE
+    WHEN o.venue = 'hyperliquid-perp' THEN
+      CASE WHEN json_extract(f.raw_json, '$.reduceOnly') = 1 THEN -(f.price * f.size) ELSE f.price * f.size END
+    WHEN o.side = 'BUY' THEN f.price * f.size
+    ELSE -(f.price * f.size)
+  END
+`;
+
+function readNetSpendUsdc(db: ReturnType<typeof getDb>, agentWalletId: string, sinceMs?: number): number {
+  const sinceClause = sinceMs === undefined ? '' : ' AND f.created_at >= ?';
+  const params = sinceMs === undefined ? [agentWalletId] : [agentWalletId, sinceMs];
+  return (db.prepare(`
+    SELECT COALESCE(SUM(${NET_SPEND_EXPR}), 0) as total
+    FROM fills f JOIN orders o ON o.id = f.order_id
+    WHERE o.agent_wallet_id = ?${sinceClause}
+  `).get(...params) as { total: number }).total;
+}
+
 function buildSystemPrompt(policy: StoredPolicy, accountState: AccountState, liveMode: boolean): string {
   const t = policy.policyJson.trading;
   const expiresAt = new Date(policy.policyJson.expiresAt).toLocaleDateString();
   const venues = policy.policyJson.allowedVenues ?? ['polymarket'];
   const hl = policy.policyJson.hyperliquid;
   const hlEnabled = venues.includes('hyperliquid') && !!hl;
-  return `You are a helpful trading assistant for an agent that trades on two venues: Polymarket (prediction markets) and Hyperliquid (crypto spot).
+  const hlMaxLeverage = hl?.maxLeverage ?? 1;
+  return `You are a helpful trading assistant for an agent that trades on two venues: Polymarket (prediction markets) and Hyperliquid (crypto spot and perps).
 
 You can:
 - Search for markets/coins and explain what they mean
@@ -194,12 +254,15 @@ You can:
 
 Venues — pick the right one:
 - POLYMARKET: prediction markets with YES/NO outcomes (elections, sports, events). Use search_markets, then place_trade with venue="polymarket", marketQuery, outcome (YES/NO).
-- HYPERLIQUID: crypto SPOT tokens bought/sold with USDC (e.g. BTC, HYPE, PURR). ${hlEnabled ? `Use search_hyperliquid_markets, then place_trade with venue="hyperliquid", coin, side, maxSpendUSDC. Hyperliquid is mainnet/real-money and requires Live mode.${hl && hl.allowedCoins.length ? ` Allowed coins: ${hl.allowedCoins.join(', ')}.` : ''}` : 'NOT enabled by this policy — tell the user Hyperliquid is not authorized; they must re-sign the policy enabling it.'}
+- HYPERLIQUID SPOT: crypto tokens bought/sold with USDC (e.g. HYPE, PURR). Use search_hyperliquid_markets with marketType="spot", then place_trade with venue="hyperliquid", marketType="spot", coin, side, maxSpendUSDC for buys or maxFraction for sells.
+- HYPERLIQUID PERPS: perpetual futures (e.g. BTC, ETH, HYPE perps). Use search_hyperliquid_markets with marketType="perp", then place_trade with venue="hyperliquid", marketType="perp", coin, side, maxSpendUSDC as notional for opening/increasing a position. BUY opens/increases a long; SELL opens/increases a short. To close/reduce, use maxFraction (1.0 = all, 0.5 = half); this submits a reduce-only order and does not flip the position. ${hlEnabled ? `Hyperliquid is mainnet/real-money and requires Live mode.${hl && hl.allowedCoins.length ? ` Allowed Hyperliquid coins: ${hl.allowedCoins.join(', ')}.` : ''}` : 'Hyperliquid is NOT enabled by this policy — tell the user Hyperliquid is not authorized; they must re-sign the policy enabling it.'}
+- HYPERLIQUID LEVERAGE: only change perp leverage when the user explicitly asks or confirms. Use set_hyperliquid_leverage with coin, leverage, and marginMode. If the user asks for a leveraged perp trade, call set_hyperliquid_leverage first, then place_trade after the leverage tool succeeds.
 
 Agent policy (signed by user, enforced deterministically):
 - Budget remaining RIGHT NOW: $${accountState.budgetRemainingUSDC.toFixed(2)} of $${t.maxBudgetUSDC.toFixed(2)} total
 - Spent so far TODAY: $${accountState.dailySpendUSDC.toFixed(2)} of $${t.maxDailySpendUSDC.toFixed(2)} daily cap
 - Max order size: $${t.maxOrderSizeUSDC.toFixed(2)} USDC per trade
+- Max Hyperliquid leverage: ${hlMaxLeverage}x
 - Open orders: ${accountState.openOrderCount}
 - Policy expires: ${expiresAt}
 
@@ -215,12 +278,12 @@ How search works:
 - Never call search_markets more than once per user message.
 
 Before calling place_trade you MUST have confirmed ALL of:
-1. The exact market (show the user the title and get confirmation)
-2. The outcome (YES or NO)
-3. The amount — for BUY: ask "How much would you like to spend?" if not specified; for SELL: use maxFraction (1.0 = all, 0.5 = half)
+1. The exact market (show the user the title/coin and get confirmation)
+2. For Polymarket, the outcome (YES or NO). For Hyperliquid, the market type and direction (spot buy/sell, perp long/short/close).
+3. The amount — for BUY/spot or opening perps: ask "How much would you like to spend?" if not specified; for spot/perp close or reduce: use maxFraction (1.0 = all, 0.5 = half)
 
 When calling place_trade: set marketQuery to the EXACT full market title from search results. Do NOT invent or guess a marketId — omit it entirely.
-For SELL trades: set maxFraction, never maxSpendUSDC.
+For Polymarket and Hyperliquid spot SELL trades: set maxFraction, never maxSpendUSDC. For Hyperliquid perp SELL, use maxSpendUSDC only when the user wants to open/increase a short; use maxFraction to close/reduce a long.
 
 CRITICAL — how trades actually happen:
 - A trade is placed ONLY by calling the place_trade tool. Writing a message is NOT placing a trade.
@@ -317,15 +380,8 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
   catch (err) { logger.warn({ agentWalletId, err }, 'portfolio fill reconcile failed'); }
   repairMatchedFillsForAgent(db, agentWalletId);
 
-  const totalSpent = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?
-  `).get(agentWalletId) as { total: number }).total;
-
-  const dailySpend = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?
-  `).get(agentWalletId, todayMs) as { total: number }).total;
+  const totalSpent = readNetSpendUsdc(db, agentWalletId);
+  const dailySpend = readNetSpendUsdc(db, agentWalletId, todayMs);
 
   const positions = db.prepare(`
     SELECT COALESCE(m.title, o.market_id) as market_title,
@@ -335,22 +391,51 @@ async function toolGetPortfolio(agentWalletId: string, policy: StoredPolicy): Pr
     FROM fills f JOIN orders o ON o.id=f.order_id
     LEFT JOIN markets m ON m.market_id=o.market_id
     LEFT JOIN market_tokens mt ON mt.token_id=o.token_id
-    WHERE o.agent_wallet_id=? GROUP BY o.market_id, o.token_id HAVING net_shares>0.001
+    WHERE o.agent_wallet_id=? AND o.venue='polymarket' GROUP BY o.market_id, o.token_id HAVING net_shares>0.001
     ORDER BY buy_cost DESC LIMIT 10
   `).all(agentWalletId) as Array<{ market_title: string; outcome: string; net_shares: number; buy_cost: number }>;
 
-  // Hyperliquid spot balances (live, from the master account) when configured.
-  let hyperliquid: { usdc: string; balances: { coin: string; total: string }[] } | null = null;
+  // Hyperliquid balances/positions (live, from the master account) when configured.
+  let hyperliquid: {
+    usdc: string;
+    balances: { coin: string; total: string }[];
+    perps: { accountValue: string; withdrawable: string; totalNtlPos: string; totalMarginUsed: string; positions: { coin: string; side: 'LONG' | 'SHORT'; size: string; value: string; entryPx: string; pnl: string; leverage: number; liquidationPx: string | null }[] } | null;
+  } | null = null;
   if (hasHlCreds(agentWalletId)) {
+    const hlClient = new HyperliquidClient();
+    let spot: { usdc: number; balances: { coin: string; total: number }[] } | null = null;
+    let perps: Awaited<ReturnType<HyperliquidClient['getPerpState']>> | null = null;
     try {
-      const state = await new HyperliquidClient().getSpotState(agentWalletId);
-      hyperliquid = {
-        usdc: state.usdc.toFixed(2),
-        balances: state.balances.filter(b => b.coin !== 'USDC').map(b => ({ coin: b.coin, total: String(b.total) })),
-      };
+      const state = await hlClient.getSpotState(agentWalletId);
+      spot = { usdc: state.usdc, balances: state.balances.filter(b => b.coin !== 'USDC') };
     } catch (err) {
-      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid balance fetch failed');
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid spot balance fetch failed');
     }
+    try {
+      perps = await hlClient.getPerpState(agentWalletId);
+    } catch (err) {
+      logger.warn({ agentWalletId, err }, 'portfolio: hyperliquid perp state fetch failed');
+    }
+    if (spot || perps) hyperliquid = {
+      usdc: (spot?.usdc ?? 0).toFixed(2),
+      balances: (spot?.balances ?? []).map(b => ({ coin: b.coin, total: String(b.total) })),
+      perps: perps ? {
+        accountValue: perps.accountValue.toFixed(2),
+        withdrawable: perps.withdrawable.toFixed(2),
+        totalNtlPos: perps.totalNtlPos.toFixed(2),
+        totalMarginUsed: perps.totalMarginUsed.toFixed(2),
+        positions: perps.positions.map(p => ({
+          coin: p.coin,
+          side: p.side,
+          size: Math.abs(p.szi).toString(),
+          value: p.positionValue.toFixed(2),
+          entryPx: p.entryPx.toString(),
+          pnl: p.unrealizedPnl.toFixed(2),
+          leverage: p.leverage,
+          liquidationPx: p.liquidationPx == null ? null : p.liquidationPx.toString(),
+        })),
+      } : null,
+    };
   }
 
   const t = policy.policyJson.trading;
@@ -499,15 +584,8 @@ async function toolPlaceTrade(
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const todayMs = today.getTime();
 
-  const totalSpent = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?
-  `).get(agentWalletId) as { total: number }).total;
-
-  const dailySpend = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?
-  `).get(agentWalletId, todayMs) as { total: number }).total;
+  const totalSpent = readNetSpendUsdc(db, agentWalletId);
+  const dailySpend = readNetSpendUsdc(db, agentWalletId, todayMs);
 
   const openOrderCount = (db.prepare(`
     SELECT COUNT(*) as cnt FROM orders WHERE agent_wallet_id=? AND status IN ('open','pending','partially_filled')
@@ -685,32 +763,117 @@ async function toolPlaceTrade(
   };
 }
 
-async function toolSearchHyperliquid(args: { query: string }): Promise<unknown> {
+async function toolSearchHyperliquid(args: { query: string; marketType?: 'spot' | 'perp' | 'all' }): Promise<unknown> {
   try {
-    const results = await new HyperliquidClient().searchSpotMarkets(args.query ?? '');
+    const marketType = args.marketType ?? 'spot';
+    const client = new HyperliquidClient();
+    const [spot, perps] = await Promise.all([
+      marketType === 'perp' ? Promise.resolve([]) : client.searchSpotMarkets(args.query ?? ''),
+      marketType === 'spot' ? Promise.resolve([]) : client.searchPerpMarkets(args.query ?? ''),
+    ]);
+    const markets = [
+      ...spot.map(r => ({ title: `${r.coin}/USDC`, coin: r.coin, price: r.price, marketType: 'spot' as const })),
+      ...perps.map(r => ({ title: `${r.coin} Perp`, coin: r.coin, price: r.price, marketType: 'perp' as const, maxLeverage: r.maxLeverage })),
+    ];
     return {
-      found: results.length,
+      found: markets.length,
       venue: 'hyperliquid',
-      markets: results.map(r => ({ title: `${r.coin}/USDC`, coin: r.coin, price: r.price })),
+      marketType,
+      markets,
     };
   } catch (err) {
     return { found: 0, markets: [], error: err instanceof Error ? err.message : 'Hyperliquid search failed' };
   }
 }
 
+async function toolSetHyperliquidLeverage(
+  args: { coin?: string; leverage?: number; marginMode?: 'cross' | 'isolated' },
+  policy: StoredPolicy,
+  agentWalletId: string,
+): Promise<unknown> {
+  logger.info({ agentWalletId, args }, 'set_hyperliquid_leverage invoked');
+  const coin = (args.coin ?? '').trim();
+  if (!coin) return { success: false, error: 'No coin specified for the Hyperliquid leverage setting.' };
+
+  const leverage = Number(args.leverage);
+  if (!Number.isInteger(leverage) || leverage < 1) {
+    return { success: false, error: 'Leverage must be a whole number greater than or equal to 1.' };
+  }
+  if (!hasHlCreds(agentWalletId)) {
+    return { success: false, error: 'No Hyperliquid API wallet configured. Add it in Agent Setup → Hyperliquid.' };
+  }
+
+  const db = getDb();
+  const liveMode = (db.prepare('SELECT paper_mode FROM agent_wallets WHERE id=?').get(agentWalletId) as { paper_mode: number } | undefined)?.paper_mode === 0;
+  if (!liveMode) {
+    return { success: false, error: 'Hyperliquid leverage changes affect mainnet settings. Switch the agent to Live mode to update leverage.' };
+  }
+
+  const usageState: UsageState = {
+    llmRequestsLastHour: 0,
+    llmSpendTodayUSDC: 0,
+    policyActive: policy.status === 'active',
+    policyExpired: policy.expiresAt.getTime() < Date.now(),
+    sessionKeyRevoked: policy.status === 'revoked',
+    intentNonceUsed: false,
+  };
+
+  const hlClient = new HyperliquidClient();
+  const asset = await hlClient.getPerpAssetInfo(coin);
+  if (!asset) return { success: false, error: `Unknown Hyperliquid perp coin: ${coin}` };
+
+  const decision = runHyperliquidLeveragePolicy({
+    policy: policy.policyJson,
+    coin: asset.coin,
+    leverage,
+    exchangeMaxLeverage: asset.maxLeverage,
+    usageState,
+  });
+  if (!decision.allowed) {
+    logger.info({ agentWalletId, reasons: decision.reasons, coin: asset.coin, leverage }, 'set_hyperliquid_leverage: policy denied');
+    return { success: false, policyDenied: true, reasons: decision.reasons, market: `${asset.coin}-PERP`, marketType: 'perp' };
+  }
+
+  const marginMode = args.marginMode === 'isolated' ? 'isolated' : 'cross';
+  try {
+    const result = await hlClient.updatePerpLeverage(agentWalletId, {
+      coin: asset.coin,
+      leverage,
+      isCross: marginMode === 'cross',
+    });
+    writeAudit({
+      userId: policy.userId,
+      agentWalletId,
+      policyId: policy.id,
+      actorType: 'agent',
+      actorId: 'chat',
+      action: result.success ? 'hyperliquid.leverage.updated' : 'hyperliquid.leverage.failed',
+      details: { venue: 'hyperliquid', marketType: 'perp', coin: result.coin, leverage, marginMode, source: 'chat', error: result.error },
+    });
+    if (!result.success) return { success: false, error: result.error ?? 'Hyperliquid leverage update failed', venue: 'hyperliquid', marketType: 'perp' };
+    return { success: true, mode: 'live', venue: 'hyperliquid', marketType: 'perp', coin: result.coin, market: `${result.coin}-PERP`, leverage: result.leverage, marginMode, maxLeverage: result.maxLeverage };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Hyperliquid leverage update failed', venue: 'hyperliquid', marketType: 'perp' };
+  }
+}
+
 async function toolPlaceHyperliquidTrade(
-  args: { coin?: string; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number },
+  args: { coin?: string; marketType?: 'spot' | 'perp'; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number; reduceOnly?: boolean },
   policy: StoredPolicy,
   agentWalletId: string,
 ): Promise<unknown> {
   logger.info({ agentWalletId, args }, 'place_trade (hyperliquid) invoked');
   const coin = (args.coin ?? '').trim();
+  const marketType = args.marketType === 'perp' ? 'perp' : 'spot';
   if (!coin) return { success: false, error: 'No coin specified for the Hyperliquid trade.' };
-  if (args.side === 'BUY' && !args.maxSpendUSDC) {
+  if (marketType === 'spot' && args.side === 'BUY' && !args.maxSpendUSDC) {
     return { success: false, needsAmount: true, error: 'Amount not specified. Ask how much USDC to spend.' };
   }
-  if (args.side === 'SELL' && !args.maxSpendUSDC && args.maxFraction === undefined) {
+  if (marketType === 'spot' && args.side === 'SELL' && !args.maxSpendUSDC && args.maxFraction === undefined) {
     return { success: false, needsAmount: true, error: 'Sell quantity not specified — use maxFraction (1.0 = sell all).' };
+  }
+  if (marketType === 'perp' && !args.maxSpendUSDC && args.maxFraction === undefined) {
+    return { success: false, needsAmount: true, error: 'Perp amount not specified. Use maxSpendUSDC as notional for opening/increasing, or maxFraction for closing/reducing.' };
   }
   if (!hasHlCreds(agentWalletId)) {
     return { success: false, error: 'No Hyperliquid API wallet configured. Add it in Agent Setup → Hyperliquid.' };
@@ -718,8 +881,8 @@ async function toolPlaceHyperliquidTrade(
 
   const db = getDb();
   const today = new Date(); today.setHours(0, 0, 0, 0); const todayMs = today.getTime();
-  const totalSpent = (db.prepare("SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as t FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?").get(agentWalletId) as { t: number }).t;
-  const dailySpend = (db.prepare("SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as t FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?").get(agentWalletId, todayMs) as { t: number }).t;
+  const totalSpent = readNetSpendUsdc(db, agentWalletId);
+  const dailySpend = readNetSpendUsdc(db, agentWalletId, todayMs);
   const openOrderCount = (db.prepare("SELECT COUNT(*) as c FROM orders WHERE agent_wallet_id=? AND status IN ('open','pending','partially_filled')").get(agentWalletId) as { c: number }).c;
 
   const accountState: AccountState = {
@@ -735,9 +898,23 @@ async function toolPlaceHyperliquidTrade(
   };
 
   const hlClient = new HyperliquidClient();
-  let orderValueUsdc = args.maxSpendUSDC ?? 0;
-  if (args.side === 'SELL') {
-    try {
+  let orderValueUsdc = 0;
+  let reduceOnly = args.reduceOnly === true;
+  try {
+    if (marketType === 'perp') {
+      const preview = await hlClient.previewPerpOrder(agentWalletId, {
+        coin,
+        side: args.side,
+        usdcAmount: args.maxSpendUSDC,
+        fraction: args.maxFraction,
+        reduceOnly: args.reduceOnly,
+      });
+      orderValueUsdc = preview.notionalUsdc;
+      reduceOnly = preview.reduceOnly;
+      if (!preview.reduceOnly && preview.availableMarginUsdc <= 0) {
+        return { success: false, error: 'No Hyperliquid perp collateral is available. Deposit USDC to Hyperliquid before opening a perp position.', venue: 'hyperliquid', marketType };
+      }
+    } else {
       const preview = await hlClient.previewSpotOrder(agentWalletId, {
         coin,
         side: args.side,
@@ -745,15 +922,20 @@ async function toolPlaceHyperliquidTrade(
         fraction: args.maxFraction,
       });
       orderValueUsdc = preview.notionalUsdc;
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : 'Could not size Hyperliquid sell order', venue: 'hyperliquid' };
     }
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : `Could not size Hyperliquid ${marketType} order`,
+      venue: 'hyperliquid',
+      marketType,
+    };
   }
 
-  const decision = runHyperliquidPolicy({ policy: policy.policyJson, coin, side: args.side, orderValueUsdc, accountState, usageState });
+  const decision = runHyperliquidPolicy({ policy: policy.policyJson, coin, side: args.side, orderValueUsdc, marketType, reduceOnly, accountState, usageState });
   if (!decision.allowed) {
     logger.info({ agentWalletId, reasons: decision.reasons }, 'place_trade (hyperliquid): policy denied');
-    return { success: false, policyDenied: true, reasons: decision.reasons, market: `${coin} (Hyperliquid spot)` };
+    return { success: false, policyDenied: true, reasons: decision.reasons, market: `${coin} (Hyperliquid ${marketType})`, marketType };
   }
 
   // Hyperliquid trades are real mainnet orders — require Live mode.
@@ -762,35 +944,44 @@ async function toolPlaceHyperliquidTrade(
     return { success: false, error: 'Hyperliquid trades execute on mainnet with real funds. Switch the agent to Live mode to trade on Hyperliquid.' };
   }
 
-  let result;
+  let result: Awaited<ReturnType<HyperliquidClient['placeSpotOrder']>> | Awaited<ReturnType<HyperliquidClient['placePerpOrder']>>;
   try {
-    result = await hlClient.placeSpotOrder(agentWalletId, {
-      coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction,
-    });
+    result = marketType === 'perp'
+      ? await hlClient.placePerpOrder(agentWalletId, {
+        coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction, reduceOnly: args.reduceOnly,
+      })
+      : await hlClient.placeSpotOrder(agentWalletId, {
+        coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction,
+      });
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Hyperliquid order failed', venue: 'hyperliquid' };
+    return { success: false, error: err instanceof Error ? err.message : 'Hyperliquid order failed', venue: 'hyperliquid', marketType };
   }
 
-  // Record into the shared intents/orders/fills tables, tagged venue='hyperliquid'.
+  // Record into the shared intents/orders/fills tables, tagged by Hyperliquid market type.
   const tradeIntentId = uuidv4(); const orderId = uuidv4(); const now = Date.now();
-  db.prepare("INSERT INTO trade_intents (id, user_id, agent_wallet_id, policy_id, session_key_address, raw_input, structured_intent_json, status, venue, created_at) VALUES (?,?,?,?,?,?,?,'executed','hyperliquid',?)")
-    .run(tradeIntentId, policy.userId, agentWalletId, policy.id, policy.sessionKeyAddress, `chat: ${args.side} ${coin} (HL spot)`, JSON.stringify({ coin, side: args.side, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction }), now);
+  const dbVenue = marketType === 'perp' ? 'hyperliquid-perp' : 'hyperliquid';
+  const marketId = marketType === 'perp' ? `${result.coin}-PERP` : result.pair;
+  const tokenId = marketType === 'perp' ? `${result.coin}-PERP` : result.coin;
+  const structuredIntent = { coin, side: args.side, marketType, usdcAmount: args.maxSpendUSDC, fraction: args.maxFraction, reduceOnly: marketType === 'perp' ? ('reduceOnly' in result ? result.reduceOnly : reduceOnly) : false };
+  db.prepare("INSERT INTO trade_intents (id, user_id, agent_wallet_id, policy_id, session_key_address, raw_input, structured_intent_json, status, venue, created_at) VALUES (?,?,?,?,?,?,?,'executed',?,?)")
+    .run(tradeIntentId, policy.userId, agentWalletId, policy.id, policy.sessionKeyAddress, `chat: ${args.side} ${coin} (HL ${marketType})`, JSON.stringify(structuredIntent), dbVenue, now);
   const status = result.success ? (result.filledSize > 0 ? 'filled' : 'open') : 'failed';
-  db.prepare("INSERT INTO orders (id, trade_intent_id, agent_wallet_id, market_id, token_id, side, price, size, order_type, expiration, clob_order_id, idempotency_key, status, venue, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,'IOC',NULL,?,?,?,'hyperliquid',?,?)")
-    .run(orderId, tradeIntentId, agentWalletId, result.pair, result.coin, args.side, result.price, result.size, result.oid != null ? String(result.oid) : null, `hl-${orderId}`, status, now, now);
+  db.prepare("INSERT INTO orders (id, trade_intent_id, agent_wallet_id, market_id, token_id, side, price, size, order_type, expiration, clob_order_id, idempotency_key, status, venue, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,'IOC',NULL,?,?,?,?,?,?)")
+    .run(orderId, tradeIntentId, agentWalletId, marketId, tokenId, args.side, result.price, result.size, result.oid != null ? String(result.oid) : null, `hl-${marketType}-${orderId}`, status, dbVenue, now, now);
   if (result.success && result.filledSize > 0) {
     db.prepare("INSERT INTO fills (id, order_id, clob_trade_id, price, size, side, fee, created_at, raw_json) VALUES (?,?,?,?,?,?,0,?,?)")
-      .run(uuidv4(), orderId, `HL-${result.oid ?? orderId}`, result.avgPrice ?? result.price, result.filledSize, args.side, now, JSON.stringify(result));
+      .run(uuidv4(), orderId, `HL-${result.oid ?? orderId}`, result.avgPrice ?? result.price, result.filledSize, args.side, now, JSON.stringify({ ...result, marketType, reduceOnly: structuredIntent.reduceOnly }));
   }
 
-  writeAudit({ userId: policy.userId, agentWalletId, policyId: policy.id, actorType: 'agent', actorId: 'chat', action: result.success ? 'order.submitted' : 'order.failed', details: { venue: 'hyperliquid', coin: result.coin, side: args.side, oid: result.oid, filledSize: result.filledSize, mode: 'live', source: 'chat' } });
+  writeAudit({ userId: policy.userId, agentWalletId, policyId: policy.id, actorType: 'agent', actorId: 'chat', action: result.success ? 'order.submitted' : 'order.failed', details: { venue: 'hyperliquid', marketType, coin: result.coin, side: args.side, reduceOnly: structuredIntent.reduceOnly, oid: result.oid, filledSize: result.filledSize, mode: 'live', source: 'chat' } });
 
-  if (!result.success) return { success: false, error: result.error ?? 'Hyperliquid order did not fill', venue: 'hyperliquid' };
+  if (!result.success) return { success: false, error: result.error ?? 'Hyperliquid order did not fill', venue: 'hyperliquid', marketType };
   return {
-    success: true, mode: 'live', venue: 'hyperliquid',
-    market: `${result.coin}/USDC (Hyperliquid spot)`, side: args.side, coin: result.coin,
+    success: true, mode: 'live', venue: 'hyperliquid', marketType,
+    market: marketType === 'perp' ? `${result.coin}-PERP (Hyperliquid perp)` : `${result.coin}/USDC (Hyperliquid spot)`, side: args.side, coin: result.coin,
     fillPrice: result.avgPrice ?? result.price, fillSize: result.filledSize,
     price: result.price, size: result.size, oid: result.oid, resting: result.resting,
+    reduceOnly: structuredIntent.reduceOnly,
   };
 }
 
@@ -804,13 +995,15 @@ async function executeTool(
     case 'search_markets':
       return toolSearchMarkets(args as { query: string });
     case 'search_hyperliquid_markets':
-      return toolSearchHyperliquid(args as { query: string });
+      return toolSearchHyperliquid(args as { query: string; marketType?: 'spot' | 'perp' | 'all' });
+    case 'set_hyperliquid_leverage':
+      return toolSetHyperliquidLeverage(args as { coin?: string; leverage?: number; marginMode?: 'cross' | 'isolated' }, policy, agentWalletId);
     case 'get_portfolio':
       return toolGetPortfolio(agentWalletId, policy);
     case 'place_trade':
       if ((args as { venue?: string }).venue === 'hyperliquid') {
         return toolPlaceHyperliquidTrade(
-          args as { coin?: string; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number },
+          args as { coin?: string; marketType?: 'spot' | 'perp'; side: 'BUY' | 'SELL'; maxSpendUSDC?: number; maxFraction?: number; reduceOnly?: boolean },
           policy,
           agentWalletId,
         );
@@ -839,16 +1032,10 @@ export async function runAgentChat(
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const todayMs = today.getTime();
   repairMatchedFillsForAgent(db, agentWalletId);
-  // Budget is computed live from actual fills — never from conversation history. Spend nets
-  // BUY against SELL, and only filled orders count (open/cancelled/failed orders do not).
-  const totalSpent = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=?
-  `).get(agentWalletId) as { total: number }).total;
-  const dailySpent = (db.prepare(`
-    SELECT COALESCE(SUM(CASE WHEN o.side='BUY' THEN f.price*f.size ELSE -(f.price*f.size) END),0) as total
-    FROM fills f JOIN orders o ON o.id=f.order_id WHERE o.agent_wallet_id=? AND f.created_at>=?
-  `).get(agentWalletId, todayMs) as { total: number }).total;
+  // Budget is computed live from actual fills — never from conversation history.
+  // Only filled orders count; open/cancelled/failed orders do not.
+  const totalSpent = readNetSpendUsdc(db, agentWalletId);
+  const dailySpent = readNetSpendUsdc(db, agentWalletId, todayMs);
   const openOrderCount = (db.prepare(
     "SELECT COUNT(*) as cnt FROM orders WHERE agent_wallet_id=? AND status IN ('open','pending','partially_filled')"
   ).get(agentWalletId) as { cnt: number }).cnt;

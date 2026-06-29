@@ -13,8 +13,27 @@ export async function connectWallet(): Promise<{ address: string; provider: ethe
   return { address, provider };
 }
 
+/**
+ * A FRESH BrowserProvider bound to the current injected wallet. The app trades on multiple chains
+ * (Polygon for Polymarket, Arbitrum for Hyperliquid); a long-lived cached provider throws
+ * `network changed (NETWORK_ERROR)` when MetaMask switches chains under it. Always build a fresh
+ * provider for each on-chain operation so it reflects the current network.
+ */
+export function freshProvider(): ethers.BrowserProvider {
+  if (!window.ethereum) throw new Error('No wallet found. Install MetaMask or another Web3 wallet.');
+  return new ethers.BrowserProvider(window.ethereum as ethers.Eip1193Provider);
+}
+
+/** Switch the injected wallet to the given chain (hex id, e.g. '0x89' Polygon, '0xa4b1' Arbitrum)
+ *  and return a fresh provider already on that chain. */
+export async function providerForChain(chainIdHex: string): Promise<ethers.BrowserProvider> {
+  const eth = window.ethereum as ethers.Eip1193Provider | undefined;
+  if (!eth) throw new Error('No wallet found. Install MetaMask or another Web3 wallet.');
+  await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+  return new ethers.BrowserProvider(eth);
+}
+
 export async function signPolicyEIP712(
-  provider: ethers.BrowserProvider,
   policy: {
     version: string;
     userWallet: string;
@@ -26,7 +45,9 @@ export async function signPolicyEIP712(
     policyHash: string;
   }
 ): Promise<string> {
-  const signer = await provider.getSigner();
+  // Fresh signer — the policy signature (EIP-712 over name/version only) is chain-agnostic, but a
+  // cached provider left on another chain (e.g. after a Hyperliquid/Arbitrum action) would throw.
+  const signer = await freshProvider().getSigner();
   const domain = { name: 'PolymarketAgentPolicy', version: '1' };
   const types = {
     AgentPolicy: [

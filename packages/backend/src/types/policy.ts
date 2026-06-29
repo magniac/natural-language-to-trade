@@ -26,8 +26,9 @@ export type Venue = 'polymarket' | 'hyperliquid';
 
 export interface HyperliquidPolicy {
   maxOrderSizeUSDC: number;
-  allowedCoins: string[];   // empty = any spot coin
+  allowedCoins: string[];   // empty = any spot/perp coin
   maxSlippageBps: number;
+  maxLeverage?: number;     // optional for policies signed before leverage controls
 }
 
 export interface AgentPolicy {

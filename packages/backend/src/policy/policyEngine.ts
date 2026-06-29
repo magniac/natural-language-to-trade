@@ -197,19 +197,23 @@ export function runPolicyEngine(input: PolicyEngineInput): PolicyDecision {
   };
 }
 
-// ─── Hyperliquid spot policy (deterministic; shares global budget/daily caps) ──
+// ─── Hyperliquid policy (deterministic; shares global budget/daily caps) ──────
 
 export interface HyperliquidPolicyInput {
   policy: AgentPolicy;
   coin: string;
   side: 'BUY' | 'SELL';
   orderValueUsdc: number;
+  marketType?: 'spot' | 'perp';
+  reduceOnly?: boolean;
   accountState: AccountState;   // budget/daily/openOrders are shared across venues
   usageState: UsageState;
 }
 
 export function runHyperliquidPolicy(input: HyperliquidPolicyInput): { allowed: boolean; reasons: string[] } {
   const { policy, coin, side, orderValueUsdc, accountState, usageState } = input;
+  const marketType = input.marketType ?? 'spot';
+  const reduceOnly = input.reduceOnly === true;
   const reasons: string[] = [];
   const trading = policy.trading;
   const hl = policy.hyperliquid;
@@ -238,8 +242,10 @@ export function runHyperliquidPolicy(input: HyperliquidPolicyInput): { allowed: 
   if (orderValueUsdc > trading.maxOrderSizeUSDC)
     reasons.push(`Order size $${orderValueUsdc.toFixed(2)} exceeds max order size $${trading.maxOrderSizeUSDC}`);
 
-  // ── Budget / daily (BUY only; shared across venues) ──
-  if (side === 'BUY') {
+  // ── Budget / daily (shared across venues) ──
+  // Spot sells reduce inventory. Perp BUY/SELL both add exposure unless reduce-only.
+  const consumesBudget = marketType === 'perp' ? !reduceOnly : side === 'BUY';
+  if (consumesBudget) {
     if (orderValueUsdc > accountState.budgetRemainingUSDC)
       reasons.push(`Order $${orderValueUsdc.toFixed(2)} exceeds remaining budget $${accountState.budgetRemainingUSDC.toFixed(2)}`);
     if (accountState.dailySpendUSDC + orderValueUsdc > trading.maxDailySpendUSDC)
@@ -249,6 +255,43 @@ export function runHyperliquidPolicy(input: HyperliquidPolicyInput): { allowed: 
   // ── Open orders (shared) ──
   if (accountState.openOrderCount >= trading.maxOpenOrders)
     reasons.push(`Too many open orders: ${accountState.openOrderCount} >= max ${trading.maxOpenOrders}`);
+
+  return { allowed: reasons.length === 0, reasons };
+}
+
+export interface HyperliquidLeveragePolicyInput {
+  policy: AgentPolicy;
+  coin: string;
+  leverage: number;
+  exchangeMaxLeverage: number;
+  usageState: UsageState;
+}
+
+export function runHyperliquidLeveragePolicy(input: HyperliquidLeveragePolicyInput): { allowed: boolean; reasons: string[] } {
+  const { policy, coin, leverage, exchangeMaxLeverage, usageState } = input;
+  const reasons: string[] = [];
+  const hl = policy.hyperliquid;
+
+  if (!usageState.policyActive) reasons.push('Policy is not active');
+  if (usageState.policyExpired) reasons.push('Policy has expired');
+  if (usageState.sessionKeyRevoked) reasons.push('Session key has been revoked');
+  if (policy.expiresAt <= Math.floor(Date.now() / 1000)) reasons.push('Policy expiry timestamp has passed');
+
+  if (!(policy.allowedVenues ?? ['polymarket']).includes('hyperliquid'))
+    reasons.push('Hyperliquid trading is not allowed by this policy');
+  if (!hl) reasons.push('No Hyperliquid limits configured — re-sign the policy to enable Hyperliquid');
+
+  if (hl && hl.allowedCoins.length > 0 && !hl.allowedCoins.map(c => c.toUpperCase()).includes(coin.toUpperCase()))
+    reasons.push(`Coin ${coin} is not in the allowed Hyperliquid coins list`);
+
+  if (!Number.isInteger(leverage) || leverage < 1)
+    reasons.push('Leverage must be a whole number greater than or equal to 1');
+  if (leverage > exchangeMaxLeverage)
+    reasons.push(`Leverage ${leverage}x exceeds Hyperliquid max leverage ${exchangeMaxLeverage}x for ${coin}`);
+
+  const policyMaxLeverage = hl?.maxLeverage ?? 1;
+  if (leverage > policyMaxLeverage)
+    reasons.push(`Leverage ${leverage}x exceeds policy max leverage ${policyMaxLeverage}x`);
 
   return { allowed: reasons.length === 0, reasons };
 }
